@@ -42,6 +42,30 @@ test('release artifact discovery rejects missing and ambiguous deterministic art
   await assert.rejects(() => discoverReleaseArtifacts({root, output}), /ambiguous ZIP artifacts/);
 });
 
+test('release artifact discovery rejects each missing app or container and ambiguous app or DMG matches', async t => {
+  const missingAppRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'money-moves-release-missing-app-'));
+  t.after(() => fs.rm(missingAppRoot, {recursive:true, force:true}));
+  const missingAppOutput = path.join(missingAppRoot, 'out', 'macos-release');
+  await artifactFiles(missingAppOutput);
+  await assert.rejects(() => discoverReleaseArtifacts({root:missingAppRoot, output:missingAppOutput}), /missing required release artifact.*Money Moves\.app/);
+
+  const {root, output} = await fixture();
+  t.after(() => fs.rm(root, {recursive:true, force:true}));
+  await artifactFiles(output);
+  const zip = path.join(output, 'make', 'zip', 'darwin', 'arm64', `Money Moves-darwin-arm64-${expectedVersion}.zip`);
+  await fs.rm(zip);
+  await assert.rejects(() => discoverReleaseArtifacts({root, output}), /missing expected ARM64 ZIP/);
+  await fs.writeFile(zip, 'synthetic');
+
+  await fs.mkdir(path.join(output, 'duplicate', 'Money Moves.app'), {recursive:true});
+  await assert.rejects(() => discoverReleaseArtifacts({root, output}), /ambiguous build-output app artifacts/);
+  await fs.rm(path.join(output, 'duplicate'), {recursive:true, force:true});
+
+  await fs.mkdir(path.join(output, 'make', 'duplicate'), {recursive:true});
+  await fs.writeFile(path.join(output, 'make', 'duplicate', `Money Moves-${expectedVersion}-arm64.dmg`), 'synthetic');
+  await assert.rejects(() => discoverReleaseArtifacts({root, output}), /ambiguous DMG artifacts/);
+});
+
 test('package inspection accepts pnpm’s argument separator before an explicit output path', async t => {
   const emptyOutput = await fs.mkdtemp(path.join(os.tmpdir(), 'money-moves-package-inspection-'));
   t.after(() => fs.rm(emptyOutput, {recursive:true, force:true}));
