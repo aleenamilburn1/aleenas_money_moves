@@ -25,7 +25,7 @@ The desktop implementation is **ACCEPTED WITH LOW-RISK FOLLOW-UPS**. Read `DESKT
 
 The local vault is live authority. Backup/export is manual and encrypted. Restore is explicit and conflict-protected. Existing browser users migrate only by exporting an encrypted backup and restoring it in Electron; there is no automatic localStorage/Vercel/Supabase migration or merge.
 
-Hosted live vault sync is **DEFERRED / NOT ACCEPTED**. The historical Supabase code, migrations, reports, and setup guide are retained as research but are not in the Electron runtime. Encrypted cloud backup, Plaid, phone editing, multi-device editing, shared vaults, reimbursement UI, Shared Expenses, refunds, reporting redesign, automatic updates, signing, and notarization are not implemented.
+Hosted live vault sync is **DEFERRED / NOT ACCEPTED**. The historical Supabase code, migrations, reports, and setup guide are retained as research but are not in the Electron runtime. Encrypted cloud backup, Plaid, phone editing, multi-device editing, shared vaults, reimbursement UI, Shared Expenses, refunds, reporting redesign, and automatic updates are not implemented. V2D release-only signing and notarization is candidate-verified in `V2D_MACOS_SIGNING_NOTARIZATION_IMPLEMENTATION.md`; independent acceptance remains separate.
 
 ## Accepted V2B desktop-beta workflows
 
@@ -68,7 +68,6 @@ Fresh automated validation passed with 198 full tests and 38 Electron-focused te
 
 ## Recommended next task
 
-Prepare signing/notarization and the release-Mac visual pass, or begin the
-separately documented V3 architecture phase. Do not begin Plaid, cloud backup,
-hosted sync, phone support, shared vaults, or travel implementation without a
-separately approved scope and acceptance plan.
+Perform independent V2D candidate acceptance in a new task. Do not begin
+Plaid, cloud backup, hosted sync, phone support, shared vaults, or travel
+implementation without a separately approved scope and acceptance plan.

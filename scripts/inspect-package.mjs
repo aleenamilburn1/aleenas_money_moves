@@ -2,7 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {extractFile, listPackage} from '@electron/asar';
 
-const root = path.resolve(process.argv[2] || 'out');
+// pnpm forwards the argument separator for `pnpm run inspect:package -- out/...`.
+// Ignore it so release inspection stays explicitly scoped to the supplied output.
+const root = path.resolve(process.argv.slice(2).find(argument => argument !== '--') || 'out');
 const forbiddenSegments = new Set(['test', 'docs', 'node_modules', 'scripts', 'supabase', '.git', '.agents', '.codex', '.claude', '.pnpm-store', '__pycache__']);
 const forbiddenNames = new Set([
   'AGENTS.md', 'CHANGELOG.md', 'README.md', 'SECURITY.md', 'VERSION', 'forge.config.js',

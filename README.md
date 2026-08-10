@@ -4,7 +4,7 @@ A desktop-first, encrypted personal finance application for macOS private beta.
 
 ## Private-beta launch
 
-Install the unsigned `Money Moves-2.0.0-desktop.0-arm64.dmg` on an Apple-silicon Mac, then open **Money Moves**. Gatekeeper may require an explicit local approval because this development build is not signed or notarized.
+Release candidates are built for Apple silicon as signed, notarized DMG and ZIP artifacts. A trusted release operator must use the documented release command on an Apple-silicon Mac with the required Developer ID certificate and local Keychain notarization profile; neither credential is stored in this repository.
 
 The application, Finder/Dock, and DMG use the same canonical Money Moves mark.
 On first launch, a short **Opening your encrypted vault** screen is expected;
@@ -33,7 +33,7 @@ This release preserves the current user workflows, schema-8 migrations, IDs, buc
 
 ## Desktop foundation status
 
-The Electron shell, encrypted local-file repository, atomic replacement, generation conflict checks, manual encrypted backup/restore, single-instance behavior, package inspection, founder-approved unified app icon, and unsigned macOS DMG are accepted with low-risk follow-ups. Complete the founder’s packaged native-dialog and workflow matrix on a beta Mac before broad distribution. Hosted live vault synchronization is deferred and not accepted.
+The Electron shell, encrypted local-file repository, atomic replacement, generation conflict checks, manual encrypted backup/restore, single-instance behavior, package inspection, founder-approved unified app icon, and macOS release signing configuration are implemented. A candidate is distributable only after Apple accepts notarization, stapling and Gatekeeper checks pass, and the synthetic installation matrix is completed. Hosted live vault synchronization is deferred and not accepted.
 
 ## Monthly rollover
 
@@ -64,4 +64,4 @@ See `SECURITY.md` for the threat model.
 
 ## Important limitation
 
-Direct bank API synchronization is not included. Cloud backup, live sync, phone editing, shared vaults, reimbursement UI, Shared Expenses, refund workflows, automatic updates, signing, and notarization are intentionally out of scope for this foundation.
+Direct bank API synchronization is not included. Cloud backup, live sync, phone editing, shared vaults, reimbursement UI, Shared Expenses, refund workflows, and automatic updates remain out of scope for this foundation. Signing and notarization are release operations documented in `docs/engineering/V2D_MACOS_SIGNING_NOTARIZATION_IMPLEMENTATION.md`.

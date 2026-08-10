@@ -2,4 +2,6 @@ js/config.js
 __pycache__/
 node_modules/
 out/
+.env
+.env.*
 .DS_Store

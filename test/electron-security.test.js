@@ -42,6 +42,13 @@ test('Electron main, preload, Forge, and packaged HTML enforce the desktop secur
   assert.match(forge, /EnableEmbeddedAsarIntegrityValidation\]:true/);
   assert.match(forge, /maker-dmg/);
   assert.match(forge, /icon:'assets\/icons\/macos\/icon\.icns'/);
+  assert.match(forge, /MONEY_MOVES_RELEASE/);
+  assert.match(forge, /identity:'Developer ID Application'/);
+  assert.match(forge, /continueOnError:false/);
+  assert.match(forge, /hardenedRuntime:true/);
+  assert.match(forge, /keychainProfile:'MoneyMovesNotary'/);
+  assert.match(forge, /macos-electron\.plist/);
+  assert.match(forge, /outDir:isMacRelease \? 'out\/macos-release' : 'out'/);
   assert.match(main, /preload\.cjs/);
   assert.doesNotMatch(main, /preload\.js['"`]/);
   assert.doesNotMatch(html, /unsafe-inline|https:\/\/\*\.supabase\.co/);
