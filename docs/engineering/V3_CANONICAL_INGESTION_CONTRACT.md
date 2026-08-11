@@ -20,6 +20,8 @@ source bytes/API records
 
 The contract satisfies PRD TXN-004, ACT-001, IMP-001 through IMP-003, AGT-001, AGT-002, canonical model sections 11-12, and the invariants that source facts are auditable, provider categories are metadata, user overrides persist, and active allocations reconcile exactly.
 
+The first Plaid-enabled private beta has an active-accounting allowlist of exactly `USD`. A non-USD mutation is not converted, rounded, defaulted to USD, or admitted to cash flow; it produces deterministic quarantine evidence containing the explicit source currency and amount text. The provider-neutral contract retains currency as data rather than baking USD into identity or reconciliation so a later money-model decision can add currencies without replacing the adapter boundary.
+
 ## 2. Vocabulary and identity
 
 - **Source kind:** `manual`, `csv`, or `provider`. `provider` is deliberately not `plaid`.
@@ -191,7 +193,7 @@ The V3A target account shape evolves the existing canonical account; exact persi
 | `institutionName` | Source | Display metadata or null. |
 | `type` / `subtype` | Source | Provider-neutral enum plus raw subtype metadata if useful. Unknown remains `unknown`/null. |
 | `mask` | Source | Last displayed mask when supplied; null otherwise. Never treated as globally unique. |
-| `currency` | Source | Supported ISO code or null. Do not default when not guaranteed. |
+| `currency` | Source | Explicit source ISO code or null. Do not default when not guaranteed; non-USD marks the account unsupported for active first-beta financial ingestion. |
 | `enabled` / `hidden` | User | Controls local import/display. Source cannot change it. |
 | `sourceStatus` | Source | Active/disconnected/closed/unknown. |
 | `connectionStatus` | Operational/derived | Healthy, attention, disconnected, relink-required, etc.; not a provider field. |
@@ -202,6 +204,8 @@ The V3A target account shape evolves the existing canonical account; exact persi
 The backend exposes opaque account handles. Raw Plaid account IDs do not enter the renderer or vault. Backend stores the provider mapping encrypted or keyed for webhook/API reconciliation.
 
 An account source key uniquely maps to one local account. A new source namespace never automatically maps to an old local account even if institution, name, type, or mask match. A new account ref inside an existing namespace is also not auto-merged by mutable metadata; without an explicit provider-neutral predecessor relationship it becomes a new/disconnected candidate. Duplicate candidates may be suggested, but only explicit user confirmation creates an audited mapping or cutover.
+
+An account whose explicit source currency is not USD may retain minimal account/source status for connection diagnostics, but its financial mutations remain quarantined and excluded from active Money Moves accounting. Unknown currency remains unknown; it is never inferred from locale, institution, or another account.
 
 ## 5. Canonical source transaction
 
@@ -214,7 +218,7 @@ The transaction record must keep source facts separate from interpretation.
 | `sourceKind`, `sourceNamespace`, `sourceRecordRef` | Required stable source identity. Previous source refs may remain as aliases after lifecycle replacement. |
 | `sourceLifecycle` | Pending, posted, removed/tombstoned, or unknown. Removed is not hard delete. |
 | `amountCents` | Non-zero safe integer, positive inflow/negative outflow. Source-authoritative. |
-| `currency` | Supported uppercase ISO code. Never invented from locale or account. |
+| `currency` | `USD` for an active first-beta transaction. Other explicit/unknown currencies remain source evidence in quarantine and are never invented from locale or account. |
 | source/authorized/posted/display dates | Source fields remain distinct. Display date is derived by policy: posted date when known, otherwise source/authorized date. |
 | raw/display description | Raw is minimized source evidence; display is source-authoritative normalized evidence until a separate user display override exists. |
 | merchant/category/channel/location | Optional source metadata. Category never drives bucket/classification. Only region/country are retained for ordinary location use. |
@@ -236,12 +240,12 @@ Adapters accept a lossless decimal string plus declared source sign convention. 
 
 1. Trim only contract-approved whitespace; reject thousands separators unless the CSV profile explicitly defines them.
 2. Parse sign, whole digits, and fractional digits as strings.
-3. Currency must be in the approved two-minor-unit allowlist. Pad one fractional digit; reject more than two rather than round.
+3. For active first-beta accounting, source currency must be explicit `USD`. Pad one fractional digit; reject more than two rather than round. Any other/unknown currency is routed to quarantine before canonical transaction creation.
 4. Convert with `BigInt(whole) * 100n + BigInt(fraction)` and apply sign mapping.
-5. Reject zero, values outside JavaScript safe-integer range, scientific notation, `NaN`, infinity, parentheses unless profile-declared, and ambiguous currency.
+5. Quarantine unknown/ambiguous currency; reject zero, values outside JavaScript safe-integer range, scientific notation, `NaN`, infinity, and parentheses unless profile-declared.
 6. Only after range validation convert to JavaScript number.
 
-V3's canonical field is cents, so currencies with zero, three, or variable minor units and unofficial currencies are not safely representable. The adapter emits a bounded `SourceQuarantineV1`; the batch atomically persists that quarantine alongside valid records and may then be acknowledged, so one unsupported record does not permanently stall the cursor. The quarantine is excluded from cash flow, spending, and income and is visible as an import/connection issue. If malformed input reaches a supposedly valid transaction mutation instead of an explicit quarantine, the entire batch fails and the cursor does not advance. A future exponent-aware model requires a separate product/schema decision; it may not silently reinterpret cents.
+The V3 first-beta active allowlist is exactly USD. Even a non-USD currency that also uses two minor units is unsupported in this release and enters `SourceQuarantineV1`; currencies with zero, three, variable minor units or unofficial identifiers are also quarantined. The batch atomically persists that minimized evidence alongside valid records and may then be acknowledged, so one unsupported record does not permanently stall the cursor. Quarantine is excluded from cash flow, spending, income, allocations, and reports and is visible as an import/connection issue. If malformed input reaches a supposedly valid transaction mutation instead of an explicit quarantine, the entire batch fails and the cursor does not advance. A future exponent-aware model requires a separate product/schema decision; it may not silently reinterpret cents.
 
 ### 6.2 Exact source mappings
 
@@ -254,6 +258,12 @@ V3's canonical field is cents, so currencies with zero, three, or variable minor
 | Provider adapter for Plaid Transactions | Official Plaid Transactions amount: positive out of account, negative into account | `-plaidAmountInCents` |
 
 CSV sign profile is explicit in preview and saved import mapping. Provider category must not infer sign. Existing legacy records produced by old float/round behavior are preserved as migration history; V3A does not rewrite their amounts silently.
+
+### 6.3 Multi-currency backlog
+
+`MULTI-CURRENCY SUPPORT` is future scope, not V3A implementation. Its design must cover original transaction currency, currency-specific minor units, foreign-exchange provenance, card-network/bank FX adjustments when available, home/reporting currency policy, and cross-currency reporting for cases such as international travel. Until that design is accepted, no exchange rate, home-currency amount, or conversion provenance is invented.
+
+The current contract keeps this evolution feasible by preserving source decimal/currency/sign evidence, keeping currency explicit on accounts and transactions, quarantining rather than rewriting unsupported values, and isolating monetary parsing behind adapters. Supporting another currency still requires an intentional schema/product/migration decision; it does not require replacing source keys, mutation kinds, reconciliation, field ownership, or the adapter boundary.
 
 ## 7. Field ownership matrix
 
@@ -271,7 +281,7 @@ CSV sign profile is explicit in preview and saved import mapping. Provider categ
 | Reimbursement claims/payments/write-offs | User/domain | Adapter cannot create/change. Source inflow may become a candidate only. |
 | Refund and transfer links | User/domain | Suggestions only; never automatic authority. |
 | Review/defer status and user transaction notes | User | Never overwritten. A source conflict may add `needs_resolution` without erasing prior status history. |
-| Display date/month grouping, totals, balance state | Derived | Recompute from current active source facts and valid active interpretation. |
+| Display date/month/calendar-quarter grouping, totals, balance state | Derived | Recompute from current active source facts and valid active interpretation. |
 | Connection health/sync receipt | Operational | Does not change financial meaning. |
 
 If date or description changes after review, update source facts, preserve interpretation, write audit provenance, and recompute derived period/search data. A material date move is surfaced in activity history. If account identity changes, require a valid deterministic source-account mapping; otherwise quarantine.
@@ -395,7 +405,15 @@ V3A replaces direct `rowsToTransactions -> addTransactions` commits with:
 
 Provider-looking CSV columns (`transaction_id`, Plaid category names, etc.) do not make CSV a Plaid source and do not authorize provider semantics. Raw import facts are minimized and retained for audit.
 
-## 13. Reconciliation result
+## 13. Reporting preservation boundary
+
+V3A does not calculate or persist Quarterly Financial Reports. It must preserve the canonical encrypted-vault inputs required for a later read/derive reporting service: stable account and transaction identity, USD cents/sign, source/authorized/posted dates, lifecycle/tombstones, allocations and protected movement semantics, review/conflict state, and audit provenance.
+
+Calendar quarters are derived periods: Q1 January-March, Q2 April-June, Q3 July-September, and Q4 October-December. Quarter close does not mutate, summarize in place of, archive away, or delete canonical transactions. Historical corrections and user allocation/classification changes remain possible, so any future local report snapshot must identify its calculation policy and source revision/checkpoint, remain traceable to detailed history, and be recomputable.
+
+Reports use local vault authority only. Temporary backend sync payloads and operational records are neither report inputs nor report storage, and their deletion has no effect on local history. The dedicated V3R phase defines report calculations, persistence/cache choices, UI, and acceptance after V3D supplies the complete live history feed.
+
+## 14. Reconciliation result
 
 The engine returns only safe local information:
 
@@ -422,13 +440,13 @@ interface IngestionApplyResultV1 {
 
 No raw payload, description, provider ID, token, vault generation, passphrase, or stack trace crosses an error/UI boundary by default.
 
-## 14. V3A conformance and adversarial fixtures
+## 15. V3A conformance and adversarial fixtures
 
 V3A is not accepted until offline tests cover:
 
 - manual, multiple CSV sign profiles, and a fake non-Plaid provider through the same contract;
 - positive/negative/max-safe/overflow/zero/one-decimal/two-decimal/three-decimal/scientific/invalid amounts;
-- supported, unknown, unofficial, zero-decimal, and three-decimal currencies, including atomic quarantine plus cursor acknowledgement;
+- USD, explicit non-USD two-decimal, unknown, unofficial, zero-decimal, and three-decimal currencies, including preserved source evidence, exclusion from active/reporting totals, atomic quarantine, and cursor acknowledgement;
 - exact reimport, reliable external IDs, identical repeated purchases, edited/reordered files, and colliding batch IDs;
 - account add/modify/disconnect, Unknown account, renamed provider account, duplicate link namespace, and explicit user mapping;
 - added/modified/removed replay and wrong-kind mutations;
@@ -439,6 +457,7 @@ V3A is not accepted until offline tests cover:
 - oversized batch/string/metadata, unknown fields, malicious refs, cycles, invalid Unicode/control data, and malformed timestamps;
 - failure before validation, during reconcile, during domain validation, on disk full, on repository conflict, and after save before acknowledgement;
 - receipt replay after app restart and older-backup restore checkpoint mismatch;
+- proof that quarter-boundary transactions, tombstones, conflicts, and later user corrections retain enough canonical history for deterministic local reporting without a backend payload;
 - proof that adapter/domain tests contain no Plaid credential or network dependency.
 
 All accepted V2 tests must remain green. V3A adds a schema migration only in its own implementation checkpoint; this architecture checkpoint adds none.

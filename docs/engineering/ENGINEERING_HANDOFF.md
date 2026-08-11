@@ -12,7 +12,9 @@
 - Current domain schema: 9
 - Desktop package version: `2.0.0-desktop.0`
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
-- V3 Plaid/provider-neutral ingestion architecture is a documentation candidate only. No V3 source, backend, schema, migration, dependency, credential, or behavior has been added.
+- V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
+- V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Annotated tag `v3-plaid-architecture-candidate-2` identifies this documentation amendment; it is not an acceptance tag.
+- V3 remains documentation only. No V3 source, backend, schema, migration, dependency, credential, report, or behavior has been added.
 
 ## Desktop foundation
 
@@ -152,43 +154,59 @@ adds, removes, moves, or changes a signed component. Such an upgrade requires
 an intentional linkage/policy review, updated adversarial coverage, fresh
 artifacts and notarization, and new independent acceptance.
 
-## V3 architecture candidate
+## V3 Architecture Candidate 2
 
 Read these together before scoping any V3 implementation:
 
 - `V3_PLAID_ARCHITECTURE.md` records accepted-app discovery, Hosted Link in the
   system browser, pseudonymous device identity, minimal backend persistence,
   cursor acknowledgement, webhooks, disconnect/reconnect, restore behavior,
-  current official Plaid references, and V3A-V3E gates.
+  current official Plaid references, the three retention classes, local
+  quarterly-reporting boundary, and V3A-V3E plus V3R gates.
 - `V3_CANONICAL_INGESTION_CONTRACT.md` defines offline provider-neutral account
   and transaction mutations, source keys, exact cents/sign/currency handling,
   field ownership, pending-to-posted identity, modifications, tombstones,
-  conflicts, idempotency, atomic apply, and V3A adversarial fixtures.
+  conflicts, idempotency, atomic apply, USD-only active accounting with explicit
+  unsupported-currency evidence, report-sufficient history, and V3A fixtures.
 - `V3_SECURITY_TRUST_MODEL.md` defines actor possession boundaries, renderer and
   main separation, backend/KMS/token custody, device credential controls,
-  webhook verification, logging/redaction, support, threats, and phase gates.
+  webhook verification, enforceable retention classes, logging/redaction,
+  support, threats, and phase gates.
 - `V3_ARCHITECTURE_DECISIONS.md` separates product-fixed rules, current
-  Plaid-imposed behavior, architecture recommendations, and four bounded
-  founder decisions.
+  Plaid-imposed behavior, architecture recommendations, four approved founder
+  decisions, locked policies, and tunable operational parameters.
 
 The recommendation keeps every Plaid client secret/access token/public token
 out of Electron and the vault. Backend delivers public-token completion and
 temporarily encrypted sync batches; the local vault remains the durable
-financial authority. The roadmap remains sequential: V3A follows independent
+financial authority. Temporary payloads use a short post-ack recovery window;
+bounded operational records start at 90 days; active connections follow their
+connection lifecycle and are not removed because a quarter or 90 days elapsed.
+The Plaid roadmap remains sequential: V3A follows independent
 architecture acceptance, V3B follows accepted V3A boundaries, V3C follows V3B,
 V3D depends on accepted V3A and V3C, and V3E is the private-beta hardening gate.
+V3R is a separate post-V3D local Quarterly Reports product slice and does not
+turn V3E or the backend into a reporting implementation.
 
-Founder approvals required before their gates are: US/USD beta scope (V3C),
-pseudonymous device-only recovery promise (V3B), likely-duplicate Item blocking
-(V3C), and local-history retention/privacy policy review (V3E). Each register
-entry includes a recommended default; none changes the provider-neutral V3A
-contract.
+All four Candidate 1 founder decisions are approved: USD-only first-beta active
+accounting, pseudonymous Keychain-backed device identity, likely-duplicate Item
+warning/block by default with explicit separate-namespace override, and minimal
+backend retention classes. Calendar-quarter reports remain local and derived
+from detailed canonical history, which is never deleted at quarter close.
+V3B/V3D/V3E still tune exact API-session duration, temporary-payload recovery
+window, credential rotation/inactivity and inactive-connection retirement
+thresholds, and post-beta operational-record duration under the locked policy.
+
+Candidate 2 documentation-amendment validation passed `CI=true pnpm run check`,
+the full 229-test suite, the 38-test Electron suite, and diff-integrity checks.
+No test, product source, schema, migration, dependency, credential, or asset was
+added or changed.
 
 ## Recommended next task
 
-Open a separate task for independent V3 architecture acceptance. Do not begin
-V3A, V3B, Plaid, cloud backup, hosted sync, phone support, shared vaults, or
-travel implementation until that review accepts the architecture and the next
-phase receives its own bounded implementation prompt. The remaining human
-Finder/Dock/application-switcher icon-cache visual check remains a low-risk V2D
-release follow-up.
+Open a separate task for independent V3 Architecture Candidate 2 acceptance.
+Do not begin V3A, V3B, Plaid, cloud backup, hosted sync, phone support, shared
+vaults, or V3R/travel implementation until that review accepts the architecture
+and the next phase receives its own bounded implementation prompt. The remaining
+human Finder/Dock/application-switcher icon-cache visual check remains a low-risk
+V2D release follow-up.

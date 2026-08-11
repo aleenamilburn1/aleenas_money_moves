@@ -12,6 +12,7 @@
 5. A cursor never advances ahead of a durable local vault apply.
 6. User-authored classification, allocations, reimbursements/refunds/transfers, notes, and review history survive source churn.
 7. Support and observability work without exposing financial payloads or credentials.
+8. Temporary financial payloads, bounded operational records, and active connection state have distinct enforceable lifecycles; neither 90 days nor quarter close forces bank reconnection.
 
 Local vault encryption protects copied/at-rest vault files, not a running unlocked app or a compromised macOS user session. Plaid access-token confidentiality depends on the backend and KMS, not the vault passphrase.
 
@@ -127,7 +128,7 @@ The first beta uses a pseudonymous device identity as specified in `V3_PLAID_ARC
 - High-risk commands (disconnect all, rotate, revoke) require recent credential proof, request nonce/idempotency key, and revalidation of target ownership.
 - Rotation is transactional: issue/store next verifier, confirm client Keychain replacement, invalidate old after a short bounded overlap. Failed replacement leaves one recoverable valid generation, never two indefinite credentials.
 - Revoke-only recovery code can revoke/remove but cannot list connections, obtain a session, sync, or read status. It is single-use, rate-limited, high entropy, and stored only as a hash.
-- Before first Link, the user acknowledges offline custody of the revoke-only code. A disclosed 90-day connection lease is renewed only by authenticated device activity; lease expiry queues idempotent `/item/remove`. This bounds an orphaned remote Item when both Keychain credential and recovery code are lost.
+- Before first Link, the user acknowledges offline custody of the revoke-only code. Loss of both Keychain credential and revoke code has no hidden recovery path; a new Mac/new identity must re-link. Exact credential rotation/inactivity and inactive-connection retirement thresholds are V3B/V3E operational parameters, not a fixed 90-day bank-reconnection policy.
 - Credential, access token, and recovery code never enter the local vault, backup, renderer, logs, crash reports, URLs, or command lines.
 
 ## 5. Backend and secret custody
@@ -140,6 +141,18 @@ The first beta uses a pseudonymous device identity as specified in `V3_PLAID_ARC
 - Token compromise response is rotate/invalidate where supported or `/item/remove`, device/user session revocation, key rotation assessment, audit, and user notification policy.
 - Database backup contains ciphertext only; restore drills prove KMS access control and no plaintext export.
 - Outbound network policy allows exact Plaid API hosts and approved Money Moves dependencies. Provider response byte/time limits and circuit breakers apply.
+
+### 5.1 Enforceable retention classes
+
+| Class | Examples | Required lifecycle |
+|---|---|---|
+| Temporary financial sync payload | Encrypted prepared batch, bounded retry payload, transient normalized provider data | Retain only through durable encrypted-vault apply, acknowledgement, and a short bounded recovery/retry window; then cryptographically erase/delete. Exact window is tuned in V3B/V3D. Never wait for 90 days or quarter close. |
+| Bounded operational record | Security/audit event, completed idempotency receipt, coarse sync outcome, retry/error metadata, privacy-safe diagnostic | Initial founder-approved target is 90 days, enforced by V3B expiry/deletion jobs. V3E may tune the bounded duration from private-beta evidence. No financial payload. |
+| Active connection state | Pseudonymous identity/connection mapping, encrypted access-token envelope, current cursor/health, required active security/idempotency state | Retain only while required to operate an active connection or complete an applicable recovery/security process. Do not delete merely because 90 days or a calendar quarter elapsed. |
+
+Permanent connection removal must immediately disable use, destroy the access-token ciphertext/key association, remove provider mappings/cursor when no longer needed, and purge temporary financial payloads. A minimal removal/idempotency/security record may remain only under the bounded operational-record policy, after which it is deleted or irreversibly anonymized.
+
+Quarterly reporting is a local encrypted-vault concern. It neither extends temporary backend retention nor authorizes backend report data; backend cleanup never deletes canonical local financial history or a future encrypted local report snapshot.
 
 ## 6. IPC and network boundary
 
@@ -183,8 +196,8 @@ IP allowlists may be defense-in-depth but are not authenticity because documente
 
 | Class | Examples | Retention/access |
 |---|---|---|
-| Operational-safe | opaque request/connection/device IDs, endpoint/event type, coarse state, duration bucket, HTTP/provider error code, retry count, batch count/bytes, software version | Normal restricted operational log with bounded retention. |
-| Security audit | enrollment/rotation/revoke/disconnect, auth failure reason class, webhook verification result, KMS key version, administrative action | Append-oriented restricted audit; longer policy-controlled retention. |
+| Operational-safe | opaque request/connection/device IDs, endpoint/event type, coarse state, duration bucket, HTTP/provider error code, retry count, batch count/bytes, software version | Restricted operational log; initial 90-day target with enforced expiry. |
+| Security audit | enrollment/rotation/revoke/disconnect, auth failure reason class, webhook verification result, KMS key version, administrative action | Append-oriented restricted audit; initial 90-day target. Any required exception must be explicit, minimized, bounded, and approved rather than indefinite. |
 | Ephemeral sensitive | exact webhook body, provider response, prepared batch plaintext, public/access token in worker memory | Never logged; memory/TTL only. |
 | Prohibited | secrets/tokens/credentials; full descriptions; account/routing numbers; full financial payload; vault/passphrase/key; allocations/notes; journal/devotional content; search text | Must not be collected. Build/test scanners fail on representative patterns. |
 
@@ -206,6 +219,7 @@ Support searches by opaque support ID and Plaid `request_id` only in restricted 
 | Malicious renderer IPC | Keychain credential/backend commands | Exact methods, types/lengths/enums, origin check, main-selected routes, confirmations/idempotency, rate limit | Attacker may request allowed actions while renderer is compromised; sensitive destructive actions require explicit confirmation/recent auth. |
 | Stolen encrypted vault/backup | Local file boundary | AES-GCM, strong KDF, authenticated envelope, file permissions, no remote secrets | Offline passphrase attack; metadata from filesystem remains visible. |
 | Stolen Keychain device credential | Keychain→backend | Signed-app ACL where feasible, short access tokens, rotation/revocation, anomaly/rate controls, no vault key | Attacker can operate remote connections as device until revoked; cannot decrypt vault/user interpretation. |
+| Lost device credential and revoke code | Device identity→active connection | No credential in vault/backup; no hidden identity recovery; re-link under a new pseudonymous identity; monitored, explicit inactive-connection retirement policy | Existing remote connection may be orphaned until explicit removal or the tuned retirement policy acts; no arbitrary 90-day purge. |
 | Backend database read | DB→KMS | Envelope encryption, credential hashes, keyed provider IDs, no vault/cloud ledger, separate KMS IAM | Institution/health/timing metadata and ciphertext volume leak. |
 | Backend application compromise | App→KMS/Plaid | Least-privilege workers, network/IAM segmentation, audited KMS decrypt, token-by-token access, rotation/removal response | Active worker compromise can decrypt accessible tokens and fetch provider data; highest V3 residual risk. |
 | Leaked Plaid access token | Backend secret | Token encrypted at rest, never logged/client-side, invalidate/remove Item, incident audit | Token plus stolen client credentials could expose provider-authorized data until revoked. |
@@ -213,7 +227,7 @@ Support searches by opaque support ID and Plaid `request_id` only in restricted 
 | Webhook replay | Webhook queue | Five-minute age rule, verified body/signature digest idempotency, monotonic state | Very-close replay causes bounded duplicate work only. |
 | Cursor desynchronization | Plaid→backend→vault | Prepared batch; all-page rule; original-cursor restart; vault receipt; ack CAS; restore reconciliation | Provider retention gaps or operational corruption require visible rebaseline/manual repair. |
 | Sync replay | Backend→desktop | Batch ID + canonical digest + local receipt + source-key idempotency | Reconciliation bugs can still repeat non-idempotent audit events; adversarial tests required. |
-| Duplicate bank link | Browser/Plaid→backend/local accounts | Pre-link warning; pre-exchange metadata check; separate namespace; explicit mapping/cutover; no semantic auto-merge | Institution metadata may be incomplete; OAuth duplicate may invalidate an existing Item. |
+| Duplicate bank link | Browser/Plaid→backend/local accounts | Pre-link warning/block by default; intentional override only; every override keeps a separate namespace; explicit mapping/cutover; no semantic auto-merge | Institution metadata may be incomplete; an intentional override or OAuth duplicate may still invalidate an existing Item. |
 | MITM | Main/browser/backend/Plaid | TLS validation, HSTS, signed webhooks, short sessions, no token in redirect, verified backend status | Compromised root CA/host/device can defeat transport assumptions. |
 | Malicious/invalid provider payload | Provider adapter→domain | Closed schema, lossless parsing, allowlists, safe integers, relationship validation, quarantine, atomic apply | Novel valid-looking semantic errors require user review. |
 | Oversized payload/DoS | Webhook/provider/backend→desktop | Byte/count/depth/time caps, pagination caps, streaming/bounded parsing, quotas, circuit breakers | Legitimate very large histories may require chunked prepared windows without cursor violation. |
@@ -239,6 +253,7 @@ Support searches by opaque support ID and Plaid `request_id` only in restricted 
 - Renderer and vault scans prove absence of backend credentials/secrets.
 - Keychain lifecycle, credential rotation overlap, revoke-only capability, uninstall/reinstall, and stolen-credential revocation tests pass.
 - Database snapshot contains only ciphertext/verifiers/minimal metadata.
+- Retention tests distinguish short-lived financial payloads, 90-day-target operational records, and active connection state; no elapsed-quarter or fixed-90-day test disconnects a healthy active Item.
 - KMS/IAM, structured logging, rate/size limits, and incident runbook receive independent review.
 - Webhook verification rejects altered body, wrong algorithm/key/environment, expired/future JWT, replay, unknown Item, and oversized input.
 
@@ -253,9 +268,9 @@ Support searches by opaque support ID and Plaid `request_id` only in restricted 
 - Cursor cannot advance before fault-injected durable vault success.
 - All pagination/crash/ack/replay/restore cases pass.
 - Missed, duplicated, and out-of-order webhooks converge through sync.
-- Temporary batch encryption/retention/purge and support redaction pass.
+- Temporary batch encryption, acknowledgement-triggered short-window purge, and support redaction pass independently of operational-record retention and quarter boundaries.
 
 ### V3E
 
-- Independent application/backend threat-model review; dependency and infrastructure scan; secret rotation and database-restore drill; least-privilege audit; consent/retention/legal review; production incident/tabletop and removal tests.
+- Independent application/backend threat-model review; dependency and infrastructure scan; secret rotation and database-restore drill; least-privilege audit; consent/retention/legal review; production incident/tabletop and removal tests. Operational session, rotation/inactivity, temporary-payload, and record-retention durations are reviewed against beta evidence without changing locked policy.
 - Any unmitigated path from renderer/vault/logs to Plaid/backend secrets blocks private-beta release.

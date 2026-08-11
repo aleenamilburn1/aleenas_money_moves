@@ -4,7 +4,7 @@
 **Decision date:** 2026-08-11
 **Implementation effect:** None in this checkpoint
 
-This register separates product-fixed constraints, architecture recommendations, Plaid-imposed behavior, and choices that genuinely require founder approval. Recommendations are complete enough for architecture acceptance; open founder policies use an explicit default and block only the named implementation phase.
+This register separates product-fixed constraints, architecture recommendations, Plaid-imposed behavior, founder-approved policy, and operational values that later phases may tune. The four founder decisions raised by Candidate 1 are approved and no longer block architecture acceptance.
 
 ## A. Fixed by accepted product architecture
 
@@ -53,6 +53,18 @@ This register separates product-fixed constraints, architecture recommendations,
 ### FIX-08 - Phased delivery
 
 **Decision:** V3 Architecture -> V3A ingestion -> V3B backend/identity -> V3C Sandbox Link -> V3D sync -> V3E hardening. The phases are not collapsed.
+
+### FIX-09 - USD-only first beta with explicit currency evidence
+
+**Decision:** Only USD financial mutations enter active accounting in the first Plaid-enabled private beta. Non-USD/unknown currency remains explicit source evidence in deterministic quarantine and is never converted, rounded, or treated as USD.
+
+**Consequence:** V3A preserves a future-compatible currency boundary. Full multi-currency behavior remains a separate product/schema decision.
+
+### FIX-10 - Quarterly reporting retains local canonical history
+
+**Decision:** Calendar quarters are a core local financial-review rhythm. Quarter close never deletes or replaces detailed encrypted-vault history. A future local Quarterly Financial Report remains derived from and traceable to canonical history.
+
+**Consequence:** Backend cleanup is a privacy/security lifecycle, not a reporting operation. Temporary backend payload deletion cannot affect local transactions or report inputs.
 
 ## B. Plaid-imposed current behavior
 
@@ -114,7 +126,7 @@ Sandbox can bypass Link, reset login, create dynamic pending/posted updates, and
 
 ### ADR-V3-003 - Device-scoped pseudonymous identity for first beta
 
-**Decision:** One random backend user, one random device, a 256-bit Keychain refresh credential, a separately saved revoke-only recovery code, and a disclosed 90-day authenticated-device connection lease. No email/password or Sign in with Apple in first beta. Loss of credential means new identity and re-link; no hidden account recovery. If the recovery code is also lost, lease expiry triggers remote Item removal.
+**Decision:** One random backend user, one random device, a 256-bit Keychain refresh credential, and a separately saved revoke-only recovery code. No email/password or Sign in with Apple in first beta. Loss of credential means new identity and re-link; there is no hidden account or Plaid-token recovery. Session duration, credential rotation/inactivity, and inactive-connection retirement thresholds are tunable operational controls, not a fixed 90-day reconnection lease.
 
 **Compared alternatives:**
 
@@ -136,7 +148,7 @@ Sandbox can bypass Link, reset login, create dynamic pending/posted updates, and
 
 **Why:** Cursor-only storage cannot guarantee byte-identical replay after backend restart/provider mutation. Reliability outweighs absolute zero server-side transaction persistence.
 
-**Limits:** Not queryable for product use; no reporting; encrypted; immediate purge after acknowledgement safety window; recommended 24-hour delivery TTL.
+**Limits:** Not queryable for product use; no reporting; encrypted; delete after durable local application, acknowledgement, and a short bounded recovery window. V3B/V3D select and test the exact window; it is unrelated to quarterly reporting or the 90-day operational-record target.
 
 ### ADR-V3-006 - Cursor acknowledgement barrier
 
@@ -168,72 +180,67 @@ Sandbox can bypass Link, reset login, create dynamic pending/posted updates, and
 
 **Why:** Avoids circular recovery and secret-bearing backups. Provider coverage gaps remain explicit rather than fabricated.
 
-### ADR-V3-011 - USD/two-minor-unit normalization boundary
+### ADR-V3-011 - USD-only active-accounting boundary
 
-**Decision:** The contract supports an explicit two-minor-unit ISO currency allowlist. Unsupported/unofficial/other-exponent currency blocks atomic import and is surfaced; no rounding.
+**Decision:** The first-beta active allowlist is exactly USD. Every adapter preserves explicit original currency/decimal/sign evidence. Non-USD, unknown, unofficial, unsafe, or unsupported-minor-unit mutations enter deterministic quarantine rather than active accounting; no conversion, default, or rounding.
 
-**Why:** Existing canonical `amountCents` cannot truthfully represent every currency. An exponent-aware redesign is future work.
+**Why:** Existing canonical `amountCents` cannot truthfully represent every currency or foreign-exchange meaning. Explicit evidence and adapter isolation keep later multi-currency work possible without redesigning source identity or reconciliation.
 
-## D. Founder decisions requiring approval
+### ADR-V3-012 - Dedicated local Quarterly Reports slice
 
-These decisions do not block architecture acceptance because the recommended default is complete. They block the named implementation/release gate if not approved.
+**Decision:** V3A preserves report-sufficient canonical history; V3D completes the live history feed; a separate post-V3D **V3R** slice implements calendar-quarter reports. V3R may run alongside bounded V3E work but has separate product/calculation/schema-if-needed/UI/test acceptance.
+
+**Why:** Reports require retained local history and careful calculation definitions but are not Plaid connectivity or backend retention. A separate slice prevents V3E from becoming an uncontrolled feature phase.
+
+## D. Founder decisions - approved
+
+The founder completed these decisions on 2026-08-11. They are locked architecture inputs for implementation prompts, not unresolved questions.
 
 ### FDR-V3-001 - First private-beta geography/currency
 
-**Business question:** Should the first live-bank beta support only US institutions and USD accounts, or attempt multiple countries/currencies?
+**Status:** **APPROVED - USD ONLY.** Only USD enters active first-beta accounting. Non-USD mutations retain explicit source-currency/amount evidence in quarantine and do not affect totals. V3A must not hard-code assumptions into source identity or reconciliation that prevent a later accepted multi-currency model.
 
-**Recommendation:** US institutions and USD only for the first private beta. V3A keeps a two-minor-unit allowlist so expansion is deliberate.
-
-**Impact:**
-
-- US/USD: smallest Link configuration, sign/currency/test matrix, consent/support surface; non-USD records are clearly unsupported, not rounded.
-- Multi-country/two-decimal currencies: more institution/OAuth/consent/localization behavior and support burden.
-- All ISO/unofficial currencies: requires an exponent-aware money model and new product/schema decision before ingestion.
-
-**Blocks:** V3C configuration and V3E live scope. Does not block provider-neutral V3A if its allowlist is injectable.
+**Backlog:** `MULTI-CURRENCY SUPPORT` covers original currency, minor units, FX provenance, card-network/bank adjustments, home/reporting currency, and cross-currency travel reporting. It is not part of V3A-D.
 
 ### FDR-V3-002 - Device-loss and remote-revocation promise
 
-**Business question:** Is “save a revoke-only recovery code; otherwise re-link after device loss” acceptable for friends/private beta, or is recoverable email identity required at launch?
+**Status:** **APPROVED - PSEUDONYMOUS DEVICE/BACKEND IDENTITY.** Backend user/device IDs are opaque; the strong durable device credential lives in macOS Keychain and never reaches renderer/vault/backup. Main derives short-lived sessions. Credentials are rotatable/revocable; a revoke-only code cannot authenticate or read data.
 
-**Recommendation:** Approve pseudonymous device identity for first beta with mandatory recovery-code acknowledgement, conspicuous disconnect guidance, and automatic remote removal after 90 days without authenticated device activity. Add passwordless email only after measured beta need.
-
-**Impact:**
-
-- Device-only: maximum privacy/minimum operations; lost Keychain credential cannot recover the old identity or connections. Revoke code removes them immediately; the 90-day lease bounds the remote orphan if that code is also lost, at the cost of disconnecting very inactive beta users.
-- Passwordless email: smoother new-Mac recovery and remote device management, but adds PII, email vendor, anti-abuse, session/account recovery, and account-takeover risk.
-- Sign in with Apple: polished Mac identity but larger implementation/operations commitment.
-
-**Blocks:** V3B identity implementation. Does not block V3A.
+**Device loss/new Mac:** Restored local history remains usable, but inability to prove the old identity requires a new pseudonymous identity and re-link. Plaid tokens are never restored or silently recovered. There is no arbitrary 90-day bank-reconnection rule; exact session, rotation/inactivity, and retirement thresholds are V3B/V3E tuning.
 
 ### FDR-V3-003 - Duplicate connection override
 
-**Business question:** When backend detects a likely duplicate Item before public-token exchange, may the user deliberately continue and create a separate connection?
+**Status:** **APPROVED - WARNING/BLOCK BY DEFAULT WITH EXPLICIT OVERRIDE.** Likely duplicates warn and stop automatic continuation. The user may intentionally override when appropriate. Every override retains an independently auditable connection namespace; reconciliation is explicit and deterministic.
 
-**Recommendation:** First beta blocks likely duplicates and directs users to update/reconnect the existing connection. Support explicit separate connections only after a demonstrated joint-login/use case.
+**Prohibited identity signals:** Institution name, account name, mask, merchant/transaction similarity, and heuristic resemblance never merge Items, accounts, or histories by themselves.
 
-**Impact:**
+### FDR-V3-004 - Minimal backend retention
 
-- Block: avoids billing/confusion and OAuth invalidation risk; may reject legitimate different credentials/accounts at one institution until supported.
-- Allow with confirmation: more flexible but requires separate namespaces, account-level preview, institution-specific failure handling, and stronger duplicate UX.
+**Status:** **APPROVED - THREE RETENTION CLASSES.** Temporary financial sync payloads are deleted after durable local apply, acknowledgement, and a short recovery window. Bounded operational records start with a 90-day retention target. Active connection state remains only while operationally required and is not purged because a quarter or 90 days elapsed.
 
-**Blocks:** V3C duplicate-flow acceptance. Does not block V3A/B.
+**Permanent removal:** Disable use, destroy token ciphertext/key association, remove mappings/cursor when no longer required, purge temporary payloads, and retain only a bounded minimal removal/security receipt before deletion/anonymization. Local encrypted financial history is separate and remains until a future explicit local-delete workflow.
 
-### FDR-V3-004 - Local retention after provider consent revocation
+## E. Locked policy versus operational tuning
 
-**Business question:** What privacy/legal retention policy applies to previously imported local records after a user revokes provider consent or disconnects?
+### Locked architectural policy
 
-**Recommendation:** Preserve locally because it is required to provide the user's requested local finance product and because deletion would destroy allocations/history, while immediately ending remote access and providing a separately confirmed local-delete path later. Obtain privacy/legal review before live limited production.
+- Active first-beta accounting is USD only; unsupported currency evidence remains explicit.
+- Pseudonymous user/device identity and Keychain credential custody are mandatory; renderer/vault never receive the durable credential.
+- Duplicate connections warn/block by default and require intentional override into a separate namespace.
+- Temporary financial payloads are not durable backend history or reporting data.
+- Active connections are not killed because 90 days or a calendar quarter elapsed.
+- Operational data is bounded; its initial retention target is 90 days.
+- Quarter close preserves detailed canonical local history; backend cleanup and reporting are independent.
 
-**Impact:**
+### V3B/V3D/V3E operational tuning
 
-- Preserve: meets current product invariant and user continuity; requires clear disclosure and legal basis/documentation.
-- Delete automatically: conflicts with accepted product behavior and would silently destroy user work; not recommended.
-- Prompt at disconnect: can be future UX, but local deletion requires relationship previews and a separate design.
+- Exact short-lived backend API-session duration.
+- Exact temporary sync-payload recovery/retry window.
+- Exact device-credential rotation and inactivity thresholds.
+- Exact inactive/orphan connection retirement process, notice, and security threshold without creating a quarterly reconnection policy.
+- Whether bounded operational-record retention remains 90 days after private-beta evidence and privacy/legal review.
 
-**Blocks:** V3E live-readiness/privacy gate, not Sandbox V3C or engineering V3D.
-
-## E. Decisions intentionally deferred
+## F. Decisions intentionally deferred
 
 - Email/Apple/multi-device account recovery beyond first beta.
 - Phone app, shared vaults, cloud vault sync, or cloud allocation authority.
@@ -241,10 +248,11 @@ These decisions do not block architecture acceptance because the recommended def
 - Investment Transactions or unrelated Plaid products.
 - Automatic transfer/refund/reimbursement classification.
 - Full local financial-history deletion workflow.
-- Exponent-aware multi-currency model beyond integer cents.
+- Full `MULTI-CURRENCY SUPPORT`: original currency/minor units, FX provenance and adjustments, home/reporting currency, and cross-currency reporting.
+- V3R Quarterly Reports calculations, local snapshot/cache schema if needed, Reports UI, and comparison views.
 - OS deep-link return from Hosted Link; polling plus browser completion page is sufficient for beta.
 - Backend/vendor/infrastructure/package selection; V3B chooses implementations under this trust contract.
 
-## F. Readiness verdict
+## G. Readiness verdict
 
-**READY FOR ARCHITECTURE ACCEPTANCE.** The fixed constraints and recommended defaults form one internally consistent architecture. Founder approvals are bounded product/operational policies with named phase gates; none requires changing the V3A provider-neutral contract or the core trust model.
+**READY FOR ARCHITECTURE ACCEPTANCE.** All four Candidate 1 founder decisions are approved and incorporated. No unresolved founder decision blocks V3A or independent architecture acceptance. Remaining duration values are bounded operational tuning under locked policy, not open product architecture.

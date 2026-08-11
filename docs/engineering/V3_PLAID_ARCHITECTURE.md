@@ -1,6 +1,6 @@
 # Money Moves V3 Plaid Architecture
 
-**Status:** Architecture candidate; no V3 implementation is present
+**Status:** Architecture Candidate 2; founder decisions incorporated; no V3 implementation is present
 **Architecture date:** 2026-08-11
 **Baseline:** `12eed0a706c62598ed4f420a1ed12ea34bc38e8a` (`v2d-macos-release-accepted`)
 **Candidate 3 parent:** `f912517e3fcd5233744cb69fa03a3d1471d60dc0`
@@ -18,6 +18,8 @@ Affected product requirements and invariants are PRD sections 4.3, 8, 10.2-10.9,
 - signed amounts use safe integer cents: positive entering an owned account, negative leaving it;
 - active finalized allocations equal the transaction magnitude;
 - unknown data stays unknown;
+- the first Plaid-enabled private beta accounts for USD financial activity only while retaining explicit source-currency evidence for unsupported records;
+- calendar quarters are a local reporting rhythm, not a backend-retention or bank-reconnection clock;
 - Plaid access tokens and client secret exist only in a backend-controlled encrypted secret boundary.
 
 ## 2. Accepted application discovery
@@ -111,7 +113,7 @@ The backend is a secret broker and provider synchronization coordinator. It is n
 
 Terminal or side states are `exited`, `expired`, `duplicate_suspected`, `failed_retryable`, `failed_terminal`, and `cancelled`. State transitions use compare-and-swap and an idempotency key. Exit/cancel never creates a local connection. Expired or retryable initial sessions create a new Link session; public and Link tokens are never reused.
 
-Before token exchange, backend compares Hosted Link `results.item_add_results` institution/name/mask metadata with active connections as Plaid recommends. A likely duplicate is blocked by default and routed to existing-connection status/update mode. Names or masks alone never merge local data. If a future explicit “connect separately” choice is approved, it creates a separate connection namespace and local accounts.
+Before token exchange, backend compares Hosted Link `results.item_add_results` institution/name/mask metadata with active connections as Plaid recommends. A likely duplicate produces a warning and blocks automatic continuation by default. The user may intentionally override the warning when appropriate; the override creates or retains a separately auditable connection namespace and never silently merges local accounts or history. Institution name, account name, mask, merchant/transaction similarity, or heuristic resemblance alone never establishes identity or authorizes a merge.
 
 ### 4.5 Update, error, and removal flows
 
@@ -137,16 +139,16 @@ Use an installation-scoped pseudonymous user and device credential for the first
 | Client storage | macOS Keychain generic-password item restricted to the signed Money Moves application identity where platform APIs permit. Never in renderer storage, vault, backup, logs, command-line arguments, or environment files. |
 | Rotation | Rotate refresh credential after enrollment, suspected exposure, explicit re-enrollment, and on a bounded schedule. Permit one previous verifier only for a short overlap; invalidate it after confirmed rotation. |
 | Revocation capability | Generate a separate high-entropy revoke-only recovery code. Backend stores its hash. Require the user to acknowledge offline saving before first Link; it can revoke devices and remove Items but can never authenticate for data or sync. |
-| Inactivity lease | Every active connection has a disclosed 90-day authenticated-device lease, renewed by normal app activity. Expiry queues `/item/remove`; it never deletes local vault history. |
+| Session and credential policy | Backend access sessions are short-lived. Exact session duration and device-credential rotation/inactivity thresholds are operational parameters for V3B/V3E; they do not impose a fixed bank-reconnection interval or automatic 90-day Item removal. |
 
-This is smaller and more private than passwordless email, and operationally simpler than Sign in with Apple. Its deliberate limitation is no account recovery: loss of both Keychain credential and revoke-only code requires a new pseudonymous identity and re-linking. This limitation is appropriate only if disclosed and accepted for the first beta.
+This is smaller and more private than passwordless email, and operationally simpler than Sign in with Apple. Its founder-approved limitation is no account recovery: loss of both Keychain credential and revoke-only code requires a new pseudonymous identity and re-linking. This limitation must be disclosed for the first beta.
 
 ### 5.2 Lifecycle outcomes
 
 - **Logout:** main deletes the Keychain credential only after the user chooses whether to disconnect remote Items. “Log out and disconnect” revokes device and removes Items. “Forget this Mac” without remote removal requires the revoke code warning.
 - **Explicit revoke:** backend invalidates all device verifiers/access sessions, calls `/item/remove` for active connections, and retains only minimal security/removal audit metadata.
-- **App deletion:** macOS may leave Keychain items behind. Reinstall attempts to reuse a valid item. Uninstall guidance tells the user to disconnect first; deletion is not treated as immediate server revocation. If no authenticated device renews the lease, backend removes the Item after the disclosed 90-day limit.
-- **Credential lost:** the app cannot recover the old backend identity. The user uses the revoke-only code to remove remote Items, enrolls as a new identity, restores local history if available, and re-links. If both credential and code are lost, the old encrypted token remains unusable by the user and receives no desktop-requested sync; backend automatically calls `/item/remove` when the 90-day device lease expires. This bounded residual window is disclosed.
+- **App deletion:** macOS may leave Keychain items behind. Reinstall attempts to reuse a valid item. Uninstall guidance tells the user to disconnect first; deletion is not treated as immediate server revocation, and no arbitrary 90-day reconnection/removal timer applies.
+- **Credential lost:** the app cannot recover or transfer the old backend identity. The user uses the revoke-only code to remove remote Items, enrolls as a new identity, restores local history if available, and re-links. If both credential and code are lost, there is no hidden cloud recovery; the inaccessible remote connection follows the explicit retirement/security policy selected in V3B rather than an automatic quarterly or 90-day purge. This orphaned-connection residual risk must be disclosed and operationally monitored.
 - **New Mac:** restore the encrypted vault, enroll a new backend identity, and re-link. No device credential is copied in the vault backup.
 - **Same-Mac vault restore:** existing Keychain identity may still authenticate. A checkpoint mismatch forces restore reconciliation before incremental sync.
 - **Different-Mac vault restore:** historical data is usable. Every restored live connection displays `relink_required` until a new connection is explicitly established.
@@ -163,22 +165,29 @@ The backend database may persist only the following logical records. Sensitive c
 | `devices` | opaque device/user IDs, credential verifier, rotation generation, last seen, revoked time | Raw refresh credential, vault passphrase/key |
 | `revocation_capabilities` | user/device scope, salted code hash, used/revoked time | Raw recovery code |
 | `connection_sessions` | opaque session ID, owner/device, environment, Link-token ciphertext/reference, state/nonce, expiry, coarse result, idempotency key | Logged Link/public tokens, bank credentials, transaction payloads |
-| `connections` | opaque connection ID, owner, provider/environment, encrypted access token, KMS key/version, encrypted or keyed Item lookup, institution ID/name if operationally needed, health, inactivity lease, update/revocation state, timestamps | Allocations, buckets, notes, journal content, vault key |
+| `connections` | opaque connection ID, owner, provider/environment, encrypted access token, KMS key/version, encrypted or keyed Item lookup, institution ID/name if operationally needed, health, lifecycle/update/revocation state, last authenticated activity, policy version, timestamps | Allocations, buckets, notes, journal content, vault key |
 | `provider_accounts` | connection ID, opaque account handle, encrypted/keyed provider account ID, minimal official metadata/status | Routing/full account numbers; user-friendly local name |
-| `sync_state` | connection ID, committed opaque provider cursor encrypted at rest, cursor version, sync-needed generation, health, last attempt/success, lease/CAS fields | Durable canonical transaction ledger |
+| `sync_state` | connection ID, committed opaque provider cursor encrypted at rest, cursor version, sync-needed generation, health, last attempt/success, lock/CAS fields | Durable canonical transaction ledger |
 | `prepared_sync_batches` | batch ID, connection/device, base/end cursor, payload digest, encrypted compressed payload, status, expiry, attempt counters | Plaintext payload at rest or retention after acknowledgement/expiry |
 | `webhook_receipts` | signature/body digest, event type/code, environment, keyed Item lookup, received time, processing status, short retention | Full financial body after processing, tokens, descriptions |
 | `security_audit` | opaque actor/request/connection IDs, operation, coarse result/error code, timestamp | Secrets or financial payloads |
 
-### 6.1 Why temporary transaction batches are necessary
+### 6.1 Retention classes
 
 Fetching on desktop demand and retaining only a committed cursor is privacy-minimal but unreliable: a lost acknowledgement, backend restart, or provider mutation can cause the backend to produce a different payload for the same uncommitted cursor. Therefore the backend temporarily persists the exact prepared batch encrypted at rest until it is acknowledged or expires. It is a delivery journal, not a reporting ledger:
 
 - content is inaccessible to product reporting/support;
-- retention is short and bounded (recommended 24 hours after last delivery, immediate purge after acknowledged safety window);
+- after durable encrypted-vault application and successful acknowledgement, payload deletion occurs after only a short bounded recovery/retry window;
+- the exact short recovery window is selected and tested in V3B/V3D; it is independent of the 90-day operational-record target and never waits for quarter close;
 - one prepared batch per connection/cursor version prevents divergent in-flight payloads;
 - expiry never advances the committed cursor; a new batch is rebuilt from the committed cursor;
 - backups and ordinary backend records never contain the payload.
+
+Bounded operational records—security/audit events, completed idempotency receipts, coarse synchronization outcomes, retry/error metadata, and privacy-safe diagnostics—start with a **90-day retention target**. V3B must enforce expiry/deletion. V3E may recommend a different bounded duration using private-beta evidence; 90 days is a policy starting point, not a protocol constant.
+
+Active connection state—pseudonymous identity mapping, opaque connection/account mappings, encrypted Plaid access-token envelope, active cursor, health, and security/idempotency state still required to operate the connection—remains only while operationally required by the active connection or an applicable recovery/security process. It is not deleted because 90 days or a calendar quarter elapsed. Permanent removal destroys the access-token ciphertext/key association, provider mappings and cursor when no longer required, and all temporary financial payloads; only a minimal removal/idempotency/security record may survive under the bounded operational-record policy before deletion or irreversible anonymization.
+
+Quarterly reporting and backend cleanup are independent. A quarter is a user-facing local review period. Backend payload deletion happens as soon as its delivery/recovery purpose ends, and backend deletion never removes canonical local history.
 
 ## 7. Transactions Sync cursor/ack protocol
 
@@ -205,7 +214,7 @@ Plaid requires all pages to be pulled and requires a pagination loop to restart 
 | Disk full, vault conflict, or app crash before atomic save | Vault authority unchanged; no acknowledgement; replay later. |
 | Vault save succeeds, acknowledgement is lost | Receipt is in vault; replay is recognized and acknowledgement is retried without duplicate mutation. |
 | Backend commits acknowledgement but response is lost | Same acknowledgement is idempotently successful. |
-| Duplicate sync request/device retry | Connection lease and prepared-batch identity return one batch. |
+| Duplicate sync request/device retry | Connection coordination lock and prepared-batch identity return one batch. |
 | Older backup restored after cursor advanced | Incremental sync is blocked. Same-device identity requests an explicit full restore reconciliation from a null provider cursor; different-device restore requires re-link. No “latest wins” merge occurs. |
 
 The restore-reconciliation path is a required V3D acceptance test. Starting with a null `/transactions/sync` cursor currently requests the Item's full update history, but Money Moves must treat provider retention/coverage as fallible: compare account/source keys, surface coverage dates, never fabricate missing history, and retain restored local records.
@@ -244,31 +253,45 @@ An encrypted backup may contain canonical account/transaction history, source au
 
 Remote disconnect removes provider access and stops billing as required by Plaid. It does not delete encrypted local history. A future “delete local connection history” operation must be separately designed, preview affected allocations/claims/audit records, and never be implied by Disconnect Bank.
 
-## 10. Phase boundaries and gates
+## 10. Quarterly reporting boundary
+
+Money Moves uses calendar quarters—Q1 January through March, Q2 April through June, Q3 July through September, and Q4 October through December—as a core financial-review rhythm. A future dedicated Reports product area may create a persistent **local Quarterly Financial Report** from canonical encrypted-vault data.
+
+The report boundary is read/derive-only over authoritative local history. It may cover income, spending/outflow, net cash flow, bucket/category breakdowns, supported savings/debt progress, month and quarter trends, account trends, and unresolved/review-required items, with later quarter-over-quarter and year-over-year comparisons. V3A must preserve the source dates, signed USD cents, account identity, allocation/classification history, lifecycle/tombstones, conflicts, and audit provenance needed to derive and later correct those views.
+
+Quarter close never deletes, rolls up in place of, or replaces detailed canonical transactions or user interpretation. A future report cache/snapshot must be encrypted locally, versioned, traceable to canonical inputs and calculation policy, and recomputable after historical corrections. It is never derived from temporary backend payloads and does not make the backend a reporting ledger.
+
+Implementation belongs in a dedicated **V3R - Quarterly Reports** slice after V3D establishes the complete live historical feed. V3R may be scheduled alongside bounded V3E hardening, but it has its own product, calculation, schema-if-needed, UI, migration, testing, and acceptance scope; it is not silently absorbed into V3E.
+
+## 11. Phase boundaries and gates
 
 ### V3A - provider-neutral ingestion
 
-No backend, Plaid dependency, credential, or network. Deliver the contract in `V3_CANONICAL_INGESTION_CONTRACT.md`, evolved schema/migration, adapter interfaces, deterministic reconciler, atomic vault application, tombstones/conflicts, and adversarial manual/CSV/synthetic-provider fixtures. Gate: all current tests plus V3A conformance tests pass; a fake provider proves no Plaid fields enter domain services.
+No backend, Plaid dependency, credential, or network. Deliver the contract in `V3_CANONICAL_INGESTION_CONTRACT.md`, evolved schema/migration, adapter interfaces, deterministic reconciler, atomic vault application, tombstones/conflicts, USD-only active-accounting enforcement with preserved source-currency quarantine evidence, report-sufficient canonical history, and adversarial manual/CSV/synthetic-provider fixtures. Gate: all current tests plus V3A conformance tests pass; a fake provider proves no Plaid fields enter domain services.
 
 ### V3B - trusted backend and identity
 
-Deliver pseudonymous device enrollment, Keychain custody in main, short-lived backend sessions, secret/KMS boundary, minimal database, redaction, rate limits, webhook verification foundation, revoke-only recovery, 90-day inactivity-lease removal worker, and no Plaid Link UI. Gate: renderer/vault secret-exfiltration tests, credential rotation/revocation, lost-device lease expiry, database-read threat test, and operational removal drill pass.
+Deliver pseudonymous device enrollment, Keychain custody in main, short-lived backend sessions, secret/KMS boundary, minimal database, redaction, rate limits, webhook verification foundation, revoke-only recovery, enforceable retention classes, connection retirement/removal handling, and no Plaid Link UI. Gate: renderer/vault secret-exfiltration tests, credential rotation/revocation, no-arbitrary-90-day-reconnect test, temporary/operational/active-state retention tests, database-read threat test, and operational removal drill pass.
 
 ### V3C - Plaid Sandbox connection
 
-Deliver Hosted Link/system-browser initial/update flows, backend public-token exchange, token encryption, Item health/removal, duplicate prevention, OAuth return, and Sandbox only. Gate: success/exit/expiry/duplicate/update/disconnect tests; renderer/vault token scans; no transaction sync persistence yet except minimum connection/account discovery agreed for the phase.
+Deliver Hosted Link/system-browser initial/update flows, backend public-token exchange, token encryption, Item health/removal, duplicate warning/block-by-default plus intentional override, OAuth return, and Sandbox only. Gate: success/exit/expiry/duplicate-warning/override/update/disconnect tests; proof every override retains a separate auditable namespace; renderer/vault token scans; no transaction sync persistence yet except minimum connection/account discovery agreed for the phase.
 
 ### V3D - transaction sync
 
 Deliver `/transactions/sync`, signed webhook intake, prepared-batch cursor/ack protocol, Plaid adapter, encrypted local application, restore reconciliation, pending/posted lineage, modified/removed handling, and fault injection. Gate: every crash/retry case, pagination mutation restart, missed webhook recovery, and authoritative local-vault check passes.
 
+### V3R - Quarterly Reports
+
+After V3D, deliver the dedicated local Reports product slice: calendar-quarter calculations, traceability to retained canonical history, correction/recomputation rules, optional encrypted local report snapshots, trend definitions, UI, and independent acceptance. V3R is not part of V3A-D and does not authorize backend reporting or history deletion.
+
 ### V3E - private-beta hardening
 
-Deliver end-to-end failure UX, support bundle, rate/size limits, retention jobs, install/reinstall/device-loss drills, consent and privacy review, limited-production configuration, operations/runbooks, and live-readiness review. Gate: independent security/privacy architecture acceptance and explicit founder approval of remaining decisions.
+Deliver end-to-end Plaid failure UX, support bundle, rate/size limits, retention jobs, install/reinstall/device-loss drills, consent and privacy review, limited-production configuration, operations/runbooks, and live-readiness review. Tune session, credential-rotation/inactivity, temporary-payload, and operational-record durations only from security/reliability evidence. Gate: independent security/privacy architecture acceptance and verification that founder-approved policies remain enforced. Reports remain the bounded V3R slice.
 
-Dependencies are strict and follow the roadmap: V3A requires architecture acceptance; V3B requires accepted V3A boundaries; V3C requires accepted V3B; V3D requires accepted V3A and V3C; V3E requires all prior acceptances. Design preparation may overlap, but implementation checkpoints and acceptance cannot be skipped or reordered. Sandbox access is never an excuse to collapse the phases.
+Dependencies are strict and preserve the Plaid roadmap: V3A requires architecture acceptance; V3B requires accepted V3A boundaries; V3C requires accepted V3B; V3D requires accepted V3A and V3C; V3E requires all prior Plaid acceptances. V3R requires accepted V3D canonical-history inputs and has a separate acceptance; it may be scheduled alongside V3E only as a bounded independent slice. Design preparation may overlap, but implementation checkpoints and acceptance cannot be skipped or reordered. Sandbox access is never an excuse to collapse the phases.
 
-## 11. Architecture quality check
+## 12. Architecture quality check
 
 | Check | Result |
 |---|---|
@@ -284,10 +307,14 @@ Dependencies are strict and follow the roadmap: V3A requires architecture accept
 | Provider fields isolated | Pass: opaque refs and provider adapter boundary. |
 | V3A is offline | Pass. |
 | Phase prompts can be bounded | Pass: dependencies and acceptance gates are explicit. |
+| USD-only beta remains future-compatible | Pass: only USD enters active accounting; original currency evidence is explicit and multi-currency is a separate backlog design. |
+| Retention classes do not force reconnect | Pass: temporary payload, 90-day operational record, and active-connection lifecycles are distinct. |
+| Quarterly reports preserve local history | Pass: quarter close is derived locally and never deletes canonical detail or controls backend cleanup. |
+| Founder decisions | Pass: all four are approved; only operational duration tuning remains. |
 
-No unresolved contradiction blocks architecture acceptance. Founder policy decisions are recorded separately and have recommended defaults.
+No unresolved contradiction or founder decision blocks architecture acceptance. Approved policies and tunable V3B/V3E parameters are recorded separately.
 
-## 12. Current official Plaid references
+## 13. Current official Plaid references
 
 Verified 2026-08-11. Plaid behavior is temporally unstable; implementation phases must re-check these sources.
 
