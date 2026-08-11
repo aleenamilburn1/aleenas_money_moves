@@ -13,7 +13,7 @@
 - Desktop package version: `2.0.0-desktop.0`
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
 - V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
-- V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Annotated tag `v3-plaid-architecture-candidate-2` identifies this documentation amendment; it is not an acceptance tag.
+- V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Candidate 2 is independently accepted by `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`; annotated tag `v3-plaid-architecture-accepted` identifies the documentation-only acceptance checkpoint.
 - V3 remains documentation only. No V3 source, backend, schema, migration, dependency, credential, report, or behavior has been added.
 
 ## Desktop foundation
@@ -154,7 +154,7 @@ adds, removes, moves, or changes a signed component. Such an upgrade requires
 an intentional linkage/policy review, updated adversarial coverage, fresh
 artifacts and notarization, and new independent acceptance.
 
-## V3 Architecture Candidate 2
+## Accepted V3 Plaid architecture
 
 Read these together before scoping any V3 implementation:
 
@@ -197,16 +197,21 @@ V3B/V3D/V3E still tune exact API-session duration, temporary-payload recovery
 window, credential rotation/inactivity and inactive-connection retirement
 thresholds, and post-beta operational-record duration under the locked policy.
 
-Candidate 2 documentation-amendment validation passed `CI=true pnpm run check`,
-the full 229-test suite, the 38-test Electron suite, and diff-integrity checks.
-No test, product source, schema, migration, dependency, credential, or asset was
-added or changed.
+Independent acceptance verified Candidate 2 against the accepted schema-9
+product, current official Plaid documentation, every trust/retention/cursor/
+reconciliation/reporting/phase gate, and the founder decision register. Fresh
+validation passed `CI=true pnpm run check`, the full 229-test suite, the 38-test
+Electron suite, and diff-integrity checks. The acceptance commit/tag changes
+documentation status only; no test, product source, schema, migration,
+dependency, credential, or asset was added or changed.
 
 ## Recommended next task
 
-Open a separate task for independent V3 Architecture Candidate 2 acceptance.
-Do not begin V3A, V3B, Plaid, cloud backup, hosted sync, phone support, shared
-vaults, or V3R/travel implementation until that review accepts the architecture
-and the next phase receives its own bounded implementation prompt. The remaining
-human Finder/Dock/application-switcher icon-cache visual check remains a low-risk
-V2D release follow-up.
+Open a bounded V3A provider-neutral ingestion implementation task. Read the PRD,
+the four V3 architecture documents, and `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`
+first. V3A must preserve/migrate schema-9 data, implement the offline canonical
+contract and adversarial fixtures, and use no Plaid/network dependency or
+credential. Do not begin V3B, V3C, V3D, V3R, or V3E until each preceding phase
+receives its own implementation and independent acceptance. The remaining human
+Finder/Dock/application-switcher icon-cache visual check remains a low-risk V2D
+release follow-up.
