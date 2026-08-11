@@ -23,6 +23,19 @@ export const REIMBURSEMENT_STATUSES = new Set(['cancelled', 'open', 'partially_p
 export const SOURCE_KINDS = new Set(['manual', 'csv', 'provider']);
 export const SOURCE_LIFECYCLES = new Set(['pending', 'posted', 'removed', 'unknown']);
 export const ALLOCATION_STATUSES = new Set(['active', 'superseded']);
+export const INGESTION_RESULT_COUNT_FIELDS = Object.freeze([
+  'accountsAdded',
+  'accountsUpdated',
+  'accountsDisconnected',
+  'transactionsAdded',
+  'transactionsUpdated',
+  'transactionsTombstoned',
+  'pendingPostedTransitions',
+  'interpretationConflicts',
+  'sourceRecordsQuarantined'
+]);
+
+const SHA256_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
 const SYSTEM_BUCKET_SEMANTICS = Object.freeze({
   [SYSTEM_BUCKET_IDS.income]:'income',
@@ -489,15 +502,86 @@ export function validateMerchantRule(value) {
   return validationResult('MerchantRule', value, errors);
 }
 
-function validateIngestionReceipt(value) {
+function validateIngestionResult(value, outerReceipt, errors) {
+  if (!isPlainObject(value)) {
+    errors.push('result must be an object');
+    return;
+  }
+  const fields = new Set(['batchId', 'payloadDigest', 'status', 'counts', 'safeErrorCodes', 'receipt']);
+  rejectUnknownFields(value, fields, 'result', errors);
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(value, field)) errors.push(`result.${field} is required`);
+  }
+  requiredString(value.batchId, 'result.batchId', errors);
+  requiredString(value.payloadDigest, 'result.payloadDigest', errors);
+  if (typeof value.payloadDigest === 'string' && !SHA256_DIGEST_PATTERN.test(value.payloadDigest)) {
+    errors.push('result.payloadDigest must be a lowercase SHA-256 hex digest');
+  }
+  requiredEnum(value.status, 'result.status', new Set(['applied', 'conflict', 'quarantined']), errors);
+
+  if (!isPlainObject(value.counts)) errors.push('result.counts must be an object');
+  else {
+    const countFields = new Set(INGESTION_RESULT_COUNT_FIELDS);
+    rejectUnknownFields(value.counts, countFields, 'result.counts', errors);
+    for (const field of INGESTION_RESULT_COUNT_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(value.counts, field)) errors.push(`result.counts.${field} is required`);
+      requiredInteger(value.counts[field], `result.counts.${field}`, errors, {min:0});
+    }
+    const expectedStatus = value.counts.interpretationConflicts > 0 ? 'conflict'
+      : value.counts.sourceRecordsQuarantined > 0 ? 'quarantined' : 'applied';
+    if (value.status !== expectedStatus) errors.push(`result.status must be ${expectedStatus} for its counts`);
+  }
+
+  if (!Array.isArray(value.safeErrorCodes)
+    || value.safeErrorCodes.some(code => typeof code !== 'string' || !code.trim())) {
+    errors.push('result.safeErrorCodes must contain non-empty strings');
+  }
+
+  if (!isPlainObject(value.receipt)) errors.push('result.receipt must be an object');
+  else {
+    const receiptFields = new Set(['connectionId', 'batchId', 'payloadDigest']);
+    rejectUnknownFields(value.receipt, receiptFields, 'result.receipt', errors);
+    for (const field of receiptFields) {
+      if (!Object.prototype.hasOwnProperty.call(value.receipt, field)) errors.push(`result.receipt.${field} is required`);
+    }
+    optionalNonEmptyString(value.receipt.connectionId, 'result.receipt.connectionId', errors);
+    requiredString(value.receipt.batchId, 'result.receipt.batchId', errors);
+    requiredString(value.receipt.payloadDigest, 'result.receipt.payloadDigest', errors);
+    if (typeof value.receipt.payloadDigest === 'string' && !SHA256_DIGEST_PATTERN.test(value.receipt.payloadDigest)) {
+      errors.push('result.receipt.payloadDigest must be a lowercase SHA-256 hex digest');
+    }
+    if (value.receipt.batchId !== outerReceipt.batchId) errors.push('result.receipt.batchId must match batchId');
+    if (value.receipt.payloadDigest !== outerReceipt.payloadDigest) errors.push('result.receipt.payloadDigest must match payloadDigest');
+    const expectedConnectionId = outerReceipt.sourceKind === 'provider' ? outerReceipt.sourceNamespace : null;
+    if (value.receipt.connectionId !== expectedConnectionId) errors.push('result.receipt.connectionId does not match the source identity');
+  }
+
+  if (value.batchId !== outerReceipt.batchId) errors.push('result.batchId must match batchId');
+  if (value.payloadDigest !== outerReceipt.payloadDigest) errors.push('result.payloadDigest must match payloadDigest');
+}
+
+export function validateIngestionReceipt(value) {
   const errors = [];
   if (!validateBaseEntity(value, 'IngestionReceipt', errors)) return validationResult('IngestionReceipt', value, errors);
+  const fields = new Set([
+    'id', 'batchId', 'payloadDigest', 'sourceKind', 'sourceNamespace', 'adapterKind', 'result', 'createdAt', 'updatedAt'
+  ]);
+  rejectUnknownFields(value, fields, 'IngestionReceipt', errors);
+  for (const field of fields) requireField(value, field, errors);
   requiredString(value.batchId, 'batchId', errors);
   requiredString(value.payloadDigest, 'payloadDigest', errors);
+  if (typeof value.payloadDigest === 'string' && !SHA256_DIGEST_PATTERN.test(value.payloadDigest)) {
+    errors.push('payloadDigest must be a lowercase SHA-256 hex digest');
+  }
   requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
   requiredString(value.sourceNamespace, 'sourceNamespace', errors);
   requiredString(value.adapterKind, 'adapterKind', errors);
-  optionalObject(value.result, 'result', errors);
+  validateIngestionResult(value.result, value, errors);
+  if (typeof value.payloadDigest === 'string'
+    && value.id !== `ingestion-receipt-${value.payloadDigest.slice(0, 20)}`) {
+    errors.push('id must be derived from payloadDigest');
+  }
+  if (value.updatedAt !== value.createdAt) errors.push('updatedAt must match immutable receipt createdAt');
   return validationResult('IngestionReceipt', value, errors);
 }
 

@@ -90,6 +90,38 @@ function addAllocation(state, transaction, amountCents = Math.abs(transaction.am
   return {allocation, bucket};
 }
 
+async function convertReceiptToCandidate1(state, batch) {
+  const receipt = state.domain.ingestionReceipts.find(item => item.batchId === batch.batchId);
+  const legacyDigest = await computeLegacyEnvelopeDigest(batch);
+  receipt.id = `ingestion-receipt-${legacyDigest.slice(0, 20)}`;
+  receipt.payloadDigest = legacyDigest;
+  receipt.result.payloadDigest = legacyDigest;
+  receipt.result.receipt.payloadDigest = legacyDigest;
+  return receipt;
+}
+
+async function appliedCandidate1Csv({csv, profile, producedAt = V3A_NOW}) {
+  const original = await createCsvMutationBatch({csvText:csv, producedAt, profile});
+  const applied = await reconcileMutationBatch(freshState(), original, {idFactory:ids(), now:producedAt});
+  const receipt = await convertReceiptToCandidate1(applied.state, original);
+  return {original, state:applied.state, receipt};
+}
+
+async function followupCsvBatch(original, {batchId, producedAt, transactionMutations}) {
+  const batch = structuredClone(original);
+  Object.assign(batch, {
+    batchId,
+    producedAt,
+    observation:{startedAt:producedAt, completedAt:producedAt, environment:'local', requestRef:null},
+    accountMutations:[],
+    transactionMutations,
+    quarantinedRecords:[],
+    sourceWarnings:[],
+    payloadDigest:''
+  });
+  return finalizeMutationBatch(batch);
+}
+
 function toSchema9(state) {
   const legacy = structuredClone(state);
   legacy.schemaVersion = 9;
@@ -711,6 +743,266 @@ test('schema-10 CSV receipts from rejected Candidate 1 replay safely and still r
     () => reconcileMutationBatch(applied.state, changed, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
     error => error.code === 'BATCH_ID_COLLISION'
   );
+});
+
+test('Candidate 1 legacy receipt replay fails closed when a corrupted nested result has no persisted transaction effects', async () => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-corrupt-legacy-receipt,USD'
+  ].join('\n');
+  const profile = {id:'corrupt-legacy-receipt-profile', signProfile:'positive_outflow'};
+  const original = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  const applied = await reconcileMutationBatch(freshState(), original, {idFactory:ids(), now:V3A_NOW});
+  const receipt = applied.state.domain.ingestionReceipts[0];
+  const legacyDigest = await computeLegacyEnvelopeDigest(original);
+  receipt.id = `ingestion-receipt-${legacyDigest.slice(0, 20)}`;
+  receipt.payloadDigest = legacyDigest;
+  receipt.result = {
+    batchId:'wrong',
+    payloadDigest:'wrong',
+    status:'applied',
+    counts:{transactionsAdded:999},
+    receipt:{batchId:'wrong', payloadDigest:'wrong'}
+  };
+  applied.state.domain.transactions = applied.state.domain.transactions.filter(item => item.sourceKind !== 'csv');
+  applied.state.domain.accounts = applied.state.domain.accounts.filter(item => item.sourceKind !== 'csv');
+  applied.state.domain.sourceAuditEvents = [];
+  assert.equal(validateDomainStore(applied.state.domain).ok, false);
+
+  const later = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:'2026-08-12T16:00:00.000Z',
+    profile
+  });
+  await assert.rejects(
+    () => reconcileMutationBatch(applied.state, later, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+    error => error.code === 'LEGACY_RECEIPT_INVALID'
+  );
+});
+
+test('Candidate 1 legacy receipt structure rejects partial, contradictory, unrelated, and corrupted records', async t => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-legacy-structure,USD'
+  ].join('\n');
+  const profile = {id:'legacy-structure-profile', signProfile:'positive_outflow'};
+  const base = await appliedCandidate1Csv({csv, profile});
+  const later = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-12T16:00:00.000Z', profile});
+  const wrongDigest = 'f'.repeat(64);
+  const cases = [
+    {name:'missing nested result', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { delete receipt.result; }},
+    {name:'nested batch ID mismatch', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.batchId = 'wrong-batch'; }},
+    {name:'nested payload digest mismatch', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.payloadDigest = wrongDigest; }},
+    {name:'missing nested receipt reference', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { delete receipt.result.receipt.batchId; }},
+    {name:'nested receipt batch mismatch', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.receipt.batchId = 'wrong-batch'; }},
+    {name:'nested receipt digest mismatch', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.receipt.payloadDigest = wrongDigest; }},
+    {name:'nested connection reference mismatch', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.receipt.connectionId = receipt.sourceNamespace; }},
+    {name:'negative result count', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.counts.transactionsAdded = -1; }},
+    {name:'impossible result count', code:'LEGACY_RECEIPT_EFFECTS_UNVERIFIED', mutate:receipt => { receipt.result.counts.transactionsAdded = 2; }},
+    {name:'contradictory status and counts', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.counts.sourceRecordsQuarantined = 1; }},
+    {name:'partial outer receipt', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { delete receipt.adapterKind; }},
+    {name:'malformed safe error codes', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.safeErrorCodes = 'not-an-array'; }},
+    {name:'unknown nested field', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.result.untrusted = true; }},
+    {name:'wrong outer receipt identifier', code:'LEGACY_RECEIPT_INVALID', mutate:receipt => { receipt.id = 'wrong-receipt-id'; }},
+    {name:'receipt from another namespace', code:'BATCH_ID_COLLISION', mutate:receipt => { receipt.sourceNamespace = 'csv:another-profile'; }},
+    {name:'corrupted legacy observation input', code:'BATCH_ID_COLLISION', mutate:receipt => {
+      receipt.createdAt = '2026-08-10T16:00:00.000Z';
+      receipt.updatedAt = receipt.createdAt;
+    }}
+  ];
+  for (const item of cases) await t.test(item.name, async () => {
+    const state = structuredClone(base.state);
+    const receipt = state.domain.ingestionReceipts.find(entry => entry.batchId === base.original.batchId);
+    item.mutate(receipt);
+    if (item.code === 'LEGACY_RECEIPT_INVALID') assert.equal(validateDomainStore(state.domain).ok, false, item.name);
+    await assert.rejects(
+      () => reconcileMutationBatch(state, later, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+      error => error.code === item.code
+    );
+  });
+
+  await t.test('changed replay payload retains collision detection', async () => {
+    const changed = structuredClone(later);
+    changed.transactionMutations[0].record.amountCents = -600;
+    changed.transactionMutations[0].record.sourceAmount.decimal = '6.00';
+    changed.payloadDigest = await computeBatchDigest(changed);
+    await assert.rejects(
+      () => reconcileMutationBatch(base.state, changed, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+      error => error.code === 'BATCH_ID_COLLISION'
+    );
+  });
+});
+
+test('Candidate 1 legacy receipt effect proof rejects missing, mismatched, and contradictory persisted evidence', async t => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-legacy-effects,USD'
+  ].join('\n');
+  const profile = {id:'legacy-effects-profile', signProfile:'positive_outflow'};
+  const base = await appliedCandidate1Csv({csv, profile});
+  const later = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-12T16:00:00.000Z', profile});
+  const cases = [
+    {name:'valid-looking receipt without effects', mutate:state => {
+      state.domain.transactions = state.domain.transactions.filter(item => item.sourceKind !== 'csv');
+      state.domain.accounts = state.domain.accounts.filter(item => item.sourceKind !== 'csv');
+      state.domain.sourceAuditEvents = [];
+    }},
+    {name:'transaction effect on wrong source account', mutate:state => {
+      state.domain.transactions.find(item => item.sourceKind === 'csv').sourceAccountRef = 'external:wrong-account';
+    }},
+    {name:'transaction effect with wrong source reference', mutate:state => {
+      const transaction = state.domain.transactions.find(item => item.sourceKind === 'csv');
+      transaction.sourceRecordRef = 'external:wrong-reference';
+      transaction.sourceTransactionId = transaction.sourceRecordRef;
+    }},
+    {name:'claimed transaction add without its batch audit', mutate:state => {
+      state.domain.sourceAuditEvents = state.domain.sourceAuditEvents.filter(item => item.entityType !== 'transaction');
+    }},
+    {name:'extra contradictory legacy mutation audit', mutate:state => {
+      const transaction = state.domain.transactions.find(item => item.sourceKind === 'csv');
+      state.domain.sourceAuditEvents.push({
+        id:'source-audit-extra-contradiction',
+        batchId:base.original.batchId,
+        entityType:'transaction',
+        entityId:transaction.id,
+        action:'unexpected',
+        changedFields:['source'],
+        observedAt:V3A_NOW,
+        createdAt:V3A_NOW,
+        updatedAt:V3A_NOW
+      });
+    }}
+  ];
+  for (const item of cases) await t.test(item.name, async () => {
+    const state = structuredClone(base.state);
+    item.mutate(state);
+    assert.equal(validateDomainStore(state.domain).ok, true, item.name);
+    await assert.rejects(
+      () => reconcileMutationBatch(state, later, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+      error => error.code === 'LEGACY_RECEIPT_EFFECTS_UNVERIFIED'
+    );
+  });
+
+  await t.test('one missing transaction from a multi-record batch', async () => {
+    const multiCsv = [
+      'date,description,amount,account_id,transaction_id,currency',
+      '2026-08-01,Coffee,5.25,checking-1,tx-legacy-multi-a,USD',
+      '2026-08-02,Lunch,8.75,checking-1,tx-legacy-multi-b,USD'
+    ].join('\n');
+    const multiProfile = {id:'legacy-multi-effects-profile', signProfile:'positive_outflow'};
+    const multi = await appliedCandidate1Csv({csv:multiCsv, profile:multiProfile});
+    const missing = multi.state.domain.transactions.find(item => item.sourceRecordRef === 'external:tx-legacy-multi-b');
+    multi.state.domain.transactions = multi.state.domain.transactions.filter(item => item.id !== missing.id);
+    multi.state.domain.sourceAuditEvents = multi.state.domain.sourceAuditEvents.filter(item => item.entityId !== missing.id);
+    assert.equal(validateDomainStore(multi.state.domain).ok, true);
+    const replay = await createCsvMutationBatch({csvText:multiCsv, producedAt:'2026-08-12T16:00:00.000Z', profile:multiProfile});
+    await assert.rejects(
+      () => reconcileMutationBatch(multi.state, replay, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+      error => error.code === 'LEGACY_RECEIPT_EFFECTS_UNVERIFIED'
+    );
+  });
+
+  await t.test('missing quarantine evidence', async () => {
+    const foreignCsv = [
+      'date,description,amount,account_id,transaction_id,currency',
+      '2026-08-01,Foreign purchase,5.25,checking-1,tx-legacy-foreign,EUR'
+    ].join('\n');
+    const foreignProfile = {id:'legacy-quarantine-effects-profile', signProfile:'positive_outflow'};
+    const foreign = await appliedCandidate1Csv({csv:foreignCsv, profile:foreignProfile});
+    foreign.state.domain.sourceQuarantines = [];
+    foreign.state.domain.sourceAuditEvents = foreign.state.domain.sourceAuditEvents.filter(item => item.entityType !== 'quarantine');
+    assert.equal(validateDomainStore(foreign.state.domain).ok, true);
+    const replay = await createCsvMutationBatch({csvText:foreignCsv, producedAt:'2026-08-12T16:00:00.000Z', profile:foreignProfile});
+    await assert.rejects(
+      () => reconcileMutationBatch(foreign.state, replay, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+      error => error.code === 'LEGACY_RECEIPT_EFFECTS_UNVERIFIED'
+    );
+  });
+
+  await t.test('empty legacy batch has no independent persisted-effect proof', async () => {
+    const emptyCsv = 'date,description,amount,account_id,transaction_id,currency';
+    const emptyProfile = {id:'legacy-empty-effects-profile', signProfile:'positive_outflow'};
+    const empty = await appliedCandidate1Csv({csv:emptyCsv, profile:emptyProfile});
+    const replay = await createCsvMutationBatch({csvText:emptyCsv, producedAt:'2026-08-12T16:00:00.000Z', profile:emptyProfile});
+    await assert.rejects(
+      () => reconcileMutationBatch(empty.state, replay, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+      error => error.code === 'LEGACY_RECEIPT_EFFECTS_UNVERIFIED'
+    );
+  });
+});
+
+test('genuine Candidate 1 effects remain provable after later source modification or tombstoning', async t => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-legacy-history,USD'
+  ].join('\n');
+  const profile = {id:'legacy-history-profile', signProfile:'positive_outflow'};
+
+  await t.test('later legitimate source modification retains historical proof', async () => {
+    const applied = await appliedCandidate1Csv({csv, profile});
+    const originalMutation = applied.original.transactionMutations[0];
+    const modifiedMutation = structuredClone(originalMutation);
+    modifiedMutation.kind = 'modify';
+    modifiedMutation.observedAt = '2026-08-12T12:00:00.000Z';
+    modifiedMutation.record.amountCents = -600;
+    modifiedMutation.record.sourceAmount.decimal = '6.00';
+    modifiedMutation.record.sourceRevision = 'revision-2';
+    const modification = await followupCsvBatch(applied.original, {
+      batchId:'csv-history-modification',
+      producedAt:modifiedMutation.observedAt,
+      transactionMutations:[modifiedMutation]
+    });
+    const changed = await reconcileMutationBatch(applied.state, modification, {
+      idFactory:ids(), now:modifiedMutation.observedAt
+    });
+    const replay = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-13T16:00:00.000Z', profile});
+    const result = await reconcileMutationBatch(changed.state, replay, {idFactory:ids(), now:'2026-08-13T16:00:00.000Z'});
+    assert.equal(result.changed, false);
+    assert.equal(result.result.status, 'already_applied');
+    assert.equal(result.state.domain.transactions.find(item => item.sourceKind === 'csv').amountCents, -600);
+  });
+
+  await t.test('later legitimate tombstone retains historical proof', async () => {
+    const applied = await appliedCandidate1Csv({csv, profile});
+    const originalMutation = applied.original.transactionMutations[0];
+    const removedAt = '2026-08-12T13:00:00.000Z';
+    const removal = await followupCsvBatch(applied.original, {
+      batchId:'csv-history-removal',
+      producedAt:removedAt,
+      transactionMutations:[{
+        kind:'remove',
+        sourceRecordRef:originalMutation.sourceRecordRef,
+        sourceAccountRef:originalMutation.sourceAccountRef,
+        observedAt:removedAt,
+        record:null,
+        removal:{reason:'source_removed', predecessorOfRef:null}
+      }]
+    });
+    const removed = await reconcileMutationBatch(applied.state, removal, {idFactory:ids(), now:removedAt});
+    const replay = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-13T16:00:00.000Z', profile});
+    const result = await reconcileMutationBatch(removed.state, replay, {idFactory:ids(), now:'2026-08-13T16:00:00.000Z'});
+    assert.equal(result.changed, false);
+    assert.equal(result.result.status, 'already_applied');
+    assert.equal(result.state.domain.transactions.find(item => item.sourceKind === 'csv').sourceLifecycle, 'removed');
+  });
+
+  await t.test('genuine retained quarantine evidence replays safely', async () => {
+    const foreignCsv = [
+      'date,description,amount,account_id,transaction_id,currency',
+      '2026-08-01,Foreign purchase,5.25,checking-1,tx-legacy-quarantine,EUR'
+    ].join('\n');
+    const foreignProfile = {id:'legacy-history-quarantine-profile', signProfile:'positive_outflow'};
+    const applied = await appliedCandidate1Csv({csv:foreignCsv, profile:foreignProfile});
+    const replay = await createCsvMutationBatch({
+      csvText:foreignCsv,
+      producedAt:'2026-08-13T16:00:00.000Z',
+      profile:foreignProfile
+    });
+    const result = await reconcileMutationBatch(applied.state, replay, {idFactory:ids(), now:'2026-08-13T16:00:00.000Z'});
+    assert.equal(result.changed, false);
+    assert.equal(result.result.status, 'already_applied');
+    assert.equal(result.result.counts.sourceRecordsQuarantined, 1);
+  });
 });
 
 test('CSV retry after persistence failure remains deterministic across production times', async () => {

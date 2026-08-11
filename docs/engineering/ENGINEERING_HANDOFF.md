@@ -14,7 +14,7 @@
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
 - V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
 - V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Candidate 2 is independently accepted by `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`; annotated tag `v3-plaid-architecture-accepted` identifies the documentation-only acceptance checkpoint.
-- V3A provider-neutral ingestion Candidate 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`) was rejected by independent acceptance. Its annotated `v3a-provider-neutral-ingestion-candidate` tag remains preserved. The narrow remediation retains schema 10 and is identified by the new annotated `v3a-provider-neutral-ingestion-candidate-2` tag after all gates pass. Candidate 2 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
+- V3A provider-neutral ingestion Candidates 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`) and 2 (`c2adfaca8411b2bdc9a050097452021e79928fcb`) were rejected by independent acceptance. Their annotated `v3a-provider-neutral-ingestion-candidate` and `v3a-provider-neutral-ingestion-candidate-2` tags remain preserved. The narrow legacy-receipt remediation retains schema 10 and is identified by annotated tag `v3a-provider-neutral-ingestion-candidate-3` after all gates pass. Candidate 3 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
 
 ## Desktop foundation
 
@@ -232,13 +232,33 @@ allocations could bypass resolution; and system classification could rewrite
 canonical signed cents. Candidate 2 corrects only those defects and their
 direct regression surface.
 
+Independent acceptance then rejected Candidate 2 because its Candidate-1
+compatibility reader validated only selected outer fields and the reconstructed
+legacy digest before returning an optional, unchecked nested receipt result. A
+schema-valid corrupted receipt with no CSV transaction effects returned
+`already_applied` and its attacker-controlled batch/digest fields.
+
 Batch receipts now use a semantic source/content digest that excludes
 `producedAt`, the observation envelope, and per-item observation timestamps.
 Those fields remain validated observability metadata. Exact later reimport and
 persistence retry reuse one deterministic receipt, while changed source
-account, amount, reference, checkpoint, or order still collides. Existing
-Candidate 1 CSV receipts are recognized only through an exact reconstruction of
-the old timestamp-bound envelope; changed content remains fail-closed.
+account, amount, reference, checkpoint, or order still collides. Candidate 3
+recognizes an existing Candidate-1 CSV receipt only when its exact outer,
+nested-result, count, and nested-reference shape is internally consistent; the
+old timestamp-bound envelope reconstructs exactly; and schema-10 account/source
+identity, current or historical transaction facts, quarantine/tombstone/conflict
+records, and distinct batch audit events prove every claimed mutation. Missing,
+wrong-account, wrong-reference, effect-less, or contradictory evidence returns
+`LEGACY_RECEIPT_EFFECTS_UNVERIFIED`; malformed or partial receipts return
+`LEGACY_RECEIPT_INVALID`; changed content remains `BATCH_ID_COLLISION`. The
+service never blindly returns a persisted nested result.
+
+Schema 10 is sufficient for this narrow proof and remains unchanged. It already
+stores the needed transaction history and durable evidence. If those fields
+cannot prove a legacy replay—such as an empty legacy batch or later source-
+account changes without retained account history—the path intentionally fails
+closed for explicit integrity handling instead of inventing a migration or
+silently reapplying a contradictory batch.
 
 Canonical transaction identity is now
 `sourceKind + sourceNamespace + sourceAccountRef + sourceRecordRef`. This uses
@@ -258,24 +278,24 @@ future local V3R phase without implementing report calculations or snapshots.
 Fresh remediation validation passed:
 
 - `CI=true pnpm run check`: passed.
-- `CI=true pnpm test`: 271 passed, 0 failed, 0 skipped, 0 todo.
+- `CI=true pnpm test`: 303 passed, 0 failed, 0 skipped, 0 todo.
 - `CI=true pnpm run electron:test`: 38 passed, 0 failed, 0 skipped, 0 todo.
-- Focused V3A suite: 40 passed, 0 failed, 0 skipped, 0 todo.
+- Focused V3A suite: 72 passed, 0 failed, 0 skipped, 0 todo.
 - `git diff --check` and the forbidden-capability/security scans: passed.
 
-These are implementation results, not independent acceptance. Candidate 1 and
-its annotated tag remain intact; the remediation is identified by annotated tag
-`v3a-provider-neutral-ingestion-candidate-2`. V3B may begin only after a new,
-separate V3A review records re-acceptance.
+These are implementation results, not independent acceptance. Candidates 1 and
+2 and both annotated tags remain intact; the remediation is identified by
+annotated tag `v3a-provider-neutral-ingestion-candidate-3`. V3B may begin only
+after a new, separate V3A review records re-acceptance.
 
 ## Recommended next task
 
 Open a new bounded independent V3A re-acceptance task from
-`v3a-provider-neutral-ingestion-candidate-2`. Re-read
+`v3a-provider-neutral-ingestion-candidate-3`. Re-read
 the PRD, all four V3 architecture documents, the architecture acceptance, and
 the V3A implementation report; independently review schema-9 migration, source
 identity, exact money, ownership, reconciliation, atomic persistence, backup,
-history retention, and scope/privacy boundaries. Repeat the 271-unit and
+history retention, and scope/privacy boundaries. Repeat the 303-unit and
 38-Electron gates and record acceptance or rejection separately. Do not begin
 V3B, V3C, V3D, V3R, or V3E until each preceding phase receives its own
 implementation and independent acceptance. The remaining human Finder/Dock/

@@ -1,11 +1,12 @@
 # Money Moves V3A — Provider-Neutral Ingestion Implementation
 
 Date: 2026-08-11
-Status: CANDIDATE 1 REJECTED; NARROW REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
+Status: CANDIDATES 1 AND 2 REJECTED; LEGACY-RECEIPT REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
 Domain schema: 10
 Trusted parent: `5d2c44925931292724bc4a2d62cfade3c969f606` (`v3-plaid-architecture-accepted`)
-Rejected candidate: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
-Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-2`
+Rejected Candidate 1: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
+Rejected Candidate 2: `c2adfaca8411b2bdc9a050097452021e79928fcb` (`v3a-provider-neutral-ingestion-candidate-2`)
+Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-3`
 
 ## Outcome and scope
 
@@ -22,7 +23,7 @@ requests, foreign-exchange conversion, a Reports UI, or V3B/V3C/V3D/V3R/V3E
 behavior. The fixture adapter is test-only source behavior implemented without
 network access. V3A is not accepted by this implementation report.
 
-## Candidate 1 rejection and narrow remediation
+## Candidate 1 and Candidate 2 rejections
 
 Independent acceptance rejected Candidate 1 after reproducing four blockers:
 
@@ -36,10 +37,19 @@ Independent acceptance rejected Candidate 1 after reproducing four blockers:
 4. Transaction source identity omitted source-account scope, so equal external
    transaction IDs in two CSV accounts collided.
 
-Candidate 2 changes only those invariants and directly related regression
-coverage. It does not reopen the accepted V3 architecture or add V3B, live
-Plaid, backend/network behavior, Hosted Link, cursor/webhook code, FX, or a
-Reports UI. Independent re-acceptance is still required in a separate review.
+Candidate 2 corrected those four invariants, but independent acceptance rejected
+it after reproducing a fifth blocker. Its Candidate-1 compatibility path
+authenticated selected outer receipt fields and the reconstructed legacy digest,
+then returned an optional, unchecked nested `result`. A schema-valid receipt
+with a valid-looking outer envelope, corrupted nested batch/digest/count fields,
+and no corresponding transaction returned `already_applied`, suppressed the
+legitimate import, and returned the corrupted identifiers.
+
+Candidate 3 changes only legacy-receipt validation, persisted-effect proof, and
+direct regression documentation/coverage. It does not reopen the accepted V3
+architecture or add V3B, live Plaid, backend/network behavior, Hosted Link,
+cursor/webhook code, FX, or a Reports UI. Independent re-acceptance is still
+required in a separate review.
 
 ## Requirements affected
 
@@ -59,6 +69,8 @@ principles. It implements or strengthens the data/service foundations for:
   references, and source changes do not replace friendly names or visibility.
 - `LOC-001`–`LOC-002`: unknown location remains explicit and ordinary canonical
   fields retain only region, country, and provenance.
+- `IMP-002`: identical replay is accepted only when receipt identity and
+  persisted source evidence agree; changed or unverifiable data fails closed.
 - `INF-001`–`INF-003` and `RMB-001`–`RMB-005`: ingestion never infers income,
   transfers, refunds, or reimbursements from provider categories; linked user
   evidence is retained and excluded from active totals while conflicted.
@@ -130,11 +142,34 @@ cannot turn identical source content into a conflicting receipt. A replayed
 write; changed account, amount, source reference, checkpoint, or ordering fails
 closed.
 
-Rejected Candidate 1 receipts used the former complete-envelope digest. Schema
-10 retains a narrow compatibility check for those CSV receipts: only an exact
-reconstruction of the Candidate 1 canonical envelope at the receipt's original
-creation time is accepted as replay. Any changed semantic content still fails
-as `BATCH_ID_COLLISION`.
+Rejected Candidate 1 receipts used the former complete-envelope digest. The
+Candidate 3 compatibility path is restricted to the exact Candidate-1 generic
+CSV batch shape and performs three independent gates:
+
+1. The immutable outer receipt, nested result, nine count fields, safe-code
+   array, and nested receipt reference must have exactly the fields Candidate 1
+   wrote. The receipt ID must derive from the outer digest; outer and nested
+   batch/digest/source references must agree; counts must be nonnegative safe
+   integers; and status must agree with conflict/quarantine counts.
+2. The current semantic batch must match the outer batch/source/adapter identity
+   and reconstruct the Candidate-1 complete-envelope digest exactly by restoring
+   `createdAt` as the original production and observation time. Changed content
+   remains `BATCH_ID_COLLISION`.
+3. Schema-10 state must prove every replayed account, transaction, or quarantine
+   effect. Account source facts must still match. Transaction identity must
+   include source account and its exact original source facts must exist either
+   currently or in retained `sourceHistory`. Receipt mutation counts must equal
+   distinct batch-scoped account/transaction/quarantine audit events, while
+   retained tombstone, quarantine, and interpretation-conflict evidence must
+   agree where applicable. Missing rows, wrong account/reference, extra audit
+   mutations, absent quarantines, or a batch with no independently provable
+   effect returns `LEGACY_RECEIPT_EFFECTS_UNVERIFIED`.
+
+The service constructs a replay result only from the validated known fields; it
+does not spread or return an unchecked nested object. Partial or malformed
+receipts return `LEGACY_RECEIPT_INVALID`. A structurally valid but unverifiable
+receipt is never reapplied automatically because the contradictory receipt may
+represent state corruption.
 
 ## Exact money and currency policy
 
@@ -268,9 +303,15 @@ schema-9→10 identity initialization in `migrations.js`, `ingestionService.js`,
 `allocationService.js`, the two focused test files, and these three engineering
 documents. There are no dependency or migration-file additions.
 
+Candidate 3 changes only `js/domain/models.js`,
+`js/services/ingestionService.js`, `test/provider-neutral-ingestion.test.js`,
+and these three engineering documents. It adds no migration, dependency, UI,
+adapter, backend, or storage-format change.
+
 ## Tests and fixtures
 
-The 40 V3A tests use only synthetic manual, CSV, and fixture-provider values.
+The 72 focused V3A checks use only synthetic manual, CSV, and fixture-provider
+values.
 They cover exact cents and sign matrices; malformed, huge, zero, missing,
 invalid, and foreign-currency values; closed contract limits; account and
 transaction identity collisions; account ownership; source/user metadata
@@ -282,21 +323,30 @@ account-scoped CSV identity; Candidate 1 receipt compatibility;
 classified/reviewed no-allocation amount conflicts; signed-source-cents
 immutability; combined two-account replay, classification, modification,
 conflict, and replay; and static absence of network/provider-product runtime
-capability.
+capability. Candidate 3 adds the independently reproduced effect-less corrupted
+receipt, missing result, wrong nested identifiers/digests/references, invalid and
+contradictory counts, partial/malformed receipts, unrelated namespaces,
+corrupted legacy timestamp inputs, changed payload, wrong source account/ref,
+missing one row from a multi-row batch, missing/extra audit evidence, missing
+quarantine evidence, an effect-less empty batch, later legitimate source
+modification, later tombstoning, and retained quarantine replay.
 
-Full remediation validation records 271 unit tests and 38 Electron-focused tests,
+Full remediation validation records 303 unit tests and 38 Electron-focused tests,
 all passing with zero failures, skips, or todos. No dependency was added.
 
 ## Schema decision
 
-The schema remains 10. The remediation changes no persisted entity shape and
-uses `sourceAccountRef`, which schema 10 already stores on every canonical
-transaction, as the missing identity component. The unaccepted schema-9→10
-migration is corrected in place so account-distinct equal external IDs remain
-external IDs instead of being replaced by local fallback references. Existing
-Candidate 1 CSV receipts receive the exact fail-closed compatibility treatment
-described above. A schema 11 migration would add no necessary field and would
-not improve safety.
+The schema remains 10. Candidate 3 changes validation and compatibility behavior,
+not persisted entity shape. Schema 10 already retains the deterministic evidence
+needed for the supported proof: source kind/namespace/account/reference,
+source-account facts, transaction source history, quarantine/tombstone/conflict
+records, and batch-scoped source audit events. Later transaction modification or
+removal does not erase the original facts. If schema-10 state cannot prove an
+edge case—for example, an empty Candidate-1 batch or source-account facts that
+were later changed without account history—the legacy replay fails closed and
+requires explicit integrity handling. Candidate 1 and Candidate 2 were never
+accepted or released, so schema 11 or a corrective migration would add risk
+without improving the supported proof.
 
 ## Security and scope review
 
@@ -308,7 +358,12 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Known limitations
 
-- Candidate 1 was rejected; Candidate 2 awaits independent re-acceptance.
+- Candidates 1 and 2 were rejected; Candidate 3 awaits independent
+  re-acceptance.
+- A structurally valid Candidate-1 receipt is insufficient by itself. Legacy
+  replay fails closed when schema-10 state cannot independently prove its
+  effects, including genuinely empty legacy batches and account-source changes
+  for which schema 10 retains no account-fact history.
 - USD is the only active accounting currency; unsupported source values are
   quarantined without conversion.
 - The current product exposes canonical CSV ingestion through the existing CSV
@@ -322,8 +377,8 @@ interpretation continue to persist only through the existing encrypted vault.
 ## Recommended next task
 
 Run an independent V3A re-acceptance review from
-`v3a-provider-neutral-ingestion-candidate-2`. Re-read the
+`v3a-provider-neutral-ingestion-candidate-3`. Re-read the
 five authoritative V3 documents, audit schema-9 migration and field ownership,
-repeat the 271-unit/38-Electron validation gate, add adversarial cases if any
+repeat the 303-unit/38-Electron validation gate, add adversarial cases if any
 gap is found, and issue a separate acceptance or rejection record. Do not begin
 V3B from this implementation report alone.

@@ -1,6 +1,8 @@
 import {STATE_SCHEMA_VERSION, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
 import {computeLegacyEnvelopeDigest, stableCanonicalJson, validateSourceMutationBatch} from '../domain/ingestionContract.js';
-import {isAllocationActive, validateDomainStore} from '../domain/models.js';
+import {
+  INGESTION_RESULT_COUNT_FIELDS, isAllocationActive, validateDomainStore, validateIngestionReceipt
+} from '../domain/models.js';
 import {advanceStateRevision} from './stateRevision.js';
 
 const clone = value => value === undefined ? undefined : structuredClone(value);
@@ -689,10 +691,201 @@ function resultCounts() {
   };
 }
 
-async function matchesRejectedCandidateCsvReceipt(receipt, batch) {
+function validatedReplayResult(receipt) {
+  return {
+    batchId:receipt.result.batchId,
+    payloadDigest:receipt.result.payloadDigest,
+    status:'already_applied',
+    counts:clone(receipt.result.counts),
+    safeErrorCodes:clone(receipt.result.safeErrorCodes),
+    receipt:clone(receipt.result.receipt)
+  };
+}
+
+function assertPersistedReceiptStructure(receipt, code) {
+  if (!validateIngestionReceipt(receipt).ok) {
+    fail(code, 'A persisted ingestion receipt failed integrity validation.');
+  }
+}
+
+function rejectedCandidateCsvBatchShapeIsPossible(batch) {
+  if (batch.sourceKind !== 'csv' || batch.adapterKind !== 'csv.generic.v1'
+    || !/^csv:[a-f0-9]{64}:[a-f0-9]{24}$/.test(batch.batchId)
+    || batch.checkpoint !== null || batch.sourceWarnings.length !== 0
+    || batch.observation.environment !== 'local' || batch.observation.requestRef !== null
+    || batch.accountMutations.some(mutation => mutation.kind !== 'add')
+    || batch.transactionMutations.some(mutation => mutation.kind !== 'add'
+      || mutation.removal !== null || mutation.record?.lifecycle !== 'posted'
+      || mutation.record?.predecessorSourceRef !== null)
+    || batch.quarantinedRecords.some(record => typeof record.sourceAccountRef !== 'string')) return false;
+  const transactionRefs = new Set();
+  for (const mutation of batch.transactionMutations) {
+    if (transactionRefs.has(mutation.sourceRecordRef)) return false;
+    transactionRefs.add(mutation.sourceRecordRef);
+  }
+  const quarantineRefs = new Set();
+  for (const record of batch.quarantinedRecords) {
+    if (quarantineRefs.has(record.sourceRecordRef) || transactionRefs.has(record.sourceRecordRef)) return false;
+    quarantineRefs.add(record.sourceRecordRef);
+  }
+  return true;
+}
+
+function exactSourceFactsFromEvidence(evidence, expected) {
+  const actual = {};
+  for (const field of Object.keys(expected)) actual[field] = evidence[field];
+  return stableCanonicalJson(actual) === stableCanonicalJson(expected);
+}
+
+function transactionHasExpectedHistoricalFacts(transaction, mutation) {
+  if (transaction.sourceKind !== 'csv' || transaction.sourceProvenance?.adapterKind !== 'csv.generic.v1') return false;
+  const expected = recordSourceFacts(mutation.record);
+  if (transaction.sourceRecordRef === mutation.sourceRecordRef
+    && stableCanonicalJson(transactionCurrentFacts(transaction)) === stableCanonicalJson(expected)) return true;
+  return (transaction.sourceHistory || []).some(history => history.sourceRecordRef === mutation.sourceRecordRef
+    && exactSourceFactsFromEvidence(history, expected));
+}
+
+function quarantineMatchesBatchRecord(evidence, batch, record) {
+  return evidence.sourceKind === 'csv'
+    && evidence.sourceNamespace === batch.sourceNamespace
+    && evidence.sourceRecordRef === record.sourceRecordRef
+    && evidence.sourceAccountRef === record.sourceAccountRef
+    && evidence.reason === record.reason
+    && evidence.rawAmountDecimal === record.rawAmountDecimal
+    && evidence.sourceCurrency === record.sourceCurrency
+    && evidence.safeDetailCode === record.safeDetailCode;
+}
+
+function auditMatches(audit, {entityType, action, entityIds, changedFields, observedAt}) {
+  return audit.entityType === entityType
+    && audit.action === action
+    && entityIds.has(audit.entityId)
+    && stableCanonicalJson(audit.changedFields) === stableCanonicalJson(changedFields)
+    && audit.observedAt === observedAt
+    && audit.createdAt === observedAt
+    && audit.updatedAt === observedAt;
+}
+
+function legacyCountsArePossible(counts, batch) {
+  return INGESTION_RESULT_COUNT_FIELDS.every(field => Number.isSafeInteger(counts[field]) && counts[field] >= 0)
+    && counts.accountsAdded <= batch.accountMutations.filter(item => item.sourceAccountRef !== 'unknown-account').length
+    && counts.accountsUpdated === 0
+    && counts.accountsDisconnected === 0
+    && counts.transactionsAdded + counts.transactionsUpdated <= batch.transactionMutations.length
+    && counts.transactionsTombstoned <= batch.quarantinedRecords.length
+    && counts.pendingPostedTransitions === 0
+    && counts.interpretationConflicts <= counts.transactionsTombstoned
+    && counts.sourceRecordsQuarantined <= batch.quarantinedRecords.length;
+}
+
+function provesRejectedCandidateCsvEffects(state, receipt, batch) {
+  const domain = state.domain;
+  if (!validateDomainStore(domain).ok || !legacyCountsArePossible(receipt.result.counts, batch)) return false;
+  if (batch.accountMutations.every(item => item.sourceAccountRef === 'unknown-account')
+    && batch.transactionMutations.length === 0 && batch.quarantinedRecords.length === 0) return false;
+  const counts = receipt.result.counts;
+  if (stableCanonicalJson(receipt.result.safeErrorCodes)
+    !== stableCanonicalJson(batch.sourceWarnings.map(item => item.code))) return false;
+
+  const accounts = accountIndex(domain);
+  const expectedAccountIds = new Set();
+  for (const mutation of batch.accountMutations) {
+    if (mutation.sourceAccountRef === 'unknown-account') continue;
+    const account = accounts.get(sourceKey('csv', batch.sourceNamespace, mutation.sourceAccountRef));
+    if (!account || account.source !== 'csv' || !accountFactsEqual(account, mutation.account)) return false;
+    expectedAccountIds.add(account.id);
+  }
+
+  const transactions = transactionIndex(domain);
+  const expectedTransactionIds = new Set();
+  for (const mutation of batch.transactionMutations) {
+    const entry = transactions.get(transactionSourceKey(
+      'csv', batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef
+    ));
+    if (!entry || !transactionHasExpectedHistoricalFacts(entry.transaction, mutation)) return false;
+    expectedTransactionIds.add(entry.transaction.id);
+  }
+  if (expectedTransactionIds.size !== batch.transactionMutations.length) return false;
+
+  for (const record of batch.quarantinedRecords) {
+    const matches = domain.sourceQuarantines.filter(item => quarantineMatchesBatchRecord(item, batch, record));
+    if (!matches.length) return false;
+  }
+  const createdQuarantines = domain.sourceQuarantines.filter(item => item.batchId === batch.batchId);
+  const quarantineEvidenceKey = item => `${item.sourceAccountRef}\u001f${item.sourceRecordRef}`;
+  if (createdQuarantines.length !== counts.sourceRecordsQuarantined
+    || new Set(createdQuarantines.map(quarantineEvidenceKey)).size !== createdQuarantines.length
+    || createdQuarantines.some(item => !batch.quarantinedRecords.some(record => quarantineMatchesBatchRecord(item, batch, record)))) return false;
+
+  const quarantineTransactionIds = new Set();
+  for (const record of batch.quarantinedRecords) {
+    const entry = transactions.get(transactionSourceKey(
+      'csv', batch.sourceNamespace, record.sourceAccountRef, record.sourceRecordRef
+    ));
+    if (entry) quarantineTransactionIds.add(entry.transaction.id);
+  }
+
+  const conflicts = domain.interpretationConflicts.filter(item => item.batchId === batch.batchId);
+  if (conflicts.length !== counts.interpretationConflicts
+    || conflicts.some(item => item.kind !== 'source_quarantined' || !quarantineTransactionIds.has(item.transactionId))) return false;
+
+  const audits = domain.sourceAuditEvents.filter(item => item.batchId === batch.batchId);
+  const accountAdds = audits.filter(item => item.entityType === 'account' && item.action === 'added');
+  const transactionAdds = audits.filter(item => item.entityType === 'transaction' && item.action === 'added');
+  const transactionUpdates = audits.filter(item => item.entityType === 'transaction' && item.action === 'modified');
+  const transactionTombstones = audits.filter(item => item.entityType === 'transaction' && item.action === 'tombstoned');
+  const quarantineAdds = audits.filter(item => item.entityType === 'quarantine' && item.action === 'quarantined');
+  if (accountAdds.length !== counts.accountsAdded
+    || transactionAdds.length !== counts.transactionsAdded
+    || transactionUpdates.length !== counts.transactionsUpdated
+    || transactionTombstones.length !== counts.transactionsTombstoned
+    || quarantineAdds.length !== counts.sourceRecordsQuarantined
+    || audits.length !== accountAdds.length + transactionAdds.length + transactionUpdates.length
+      + transactionTombstones.length + quarantineAdds.length) return false;
+  const hasUniqueEntityIds = items => new Set(items.map(item => item.entityId)).size === items.length;
+  if (!hasUniqueEntityIds(accountAdds)
+    || !hasUniqueEntityIds([...transactionAdds, ...transactionUpdates])
+    || !hasUniqueEntityIds(transactionTombstones)
+    || !hasUniqueEntityIds(quarantineAdds)) return false;
+
+  const timestamp = receipt.createdAt;
+  if (accountAdds.some(audit => !auditMatches(audit, {
+    entityType:'account', action:'added', entityIds:expectedAccountIds, changedFields:['source'], observedAt:timestamp
+  }))) return false;
+  if (transactionAdds.some(audit => !auditMatches(audit, {
+    entityType:'transaction', action:'added', entityIds:expectedTransactionIds, changedFields:['source'], observedAt:timestamp
+  }))) return false;
+  if (transactionUpdates.some(audit => audit.entityType !== 'transaction' || audit.action !== 'modified'
+    || !expectedTransactionIds.has(audit.entityId) || !audit.changedFields.includes('sourceLifecycle')
+    || audit.observedAt !== timestamp || audit.createdAt !== timestamp || audit.updatedAt !== timestamp)) return false;
+  if (transactionTombstones.some(audit => !auditMatches(audit, {
+    entityType:'transaction', action:'tombstoned', entityIds:quarantineTransactionIds,
+    changedFields:['sourceLifecycle', 'tombstone'], observedAt:timestamp
+  }))) return false;
+  const createdQuarantineIds = new Set(createdQuarantines.map(item => item.id));
+  if (quarantineAdds.some(audit => !auditMatches(audit, {
+    entityType:'quarantine', action:'quarantined', entityIds:createdQuarantineIds,
+    changedFields:['reason', 'sourceCurrency'], observedAt:timestamp
+  }))) return false;
+
+  const transactionById = new Map(domain.transactions.map(item => [item.id, item]));
+  if (transactionUpdates.some(audit => !(transactionById.get(audit.entityId)?.sourceHistory || [])
+    .some(history => history.batchId === batch.batchId && history.observedAt === timestamp))) return false;
+  if (transactionTombstones.some(audit => !(transactionById.get(audit.entityId)?.sourceHistory || [])
+    .some(history => history.batchId === batch.batchId && history.observedAt === timestamp))) return false;
+  return true;
+}
+
+async function assertRejectedCandidateCsvReplay(state, receipt, batch) {
+  assertPersistedReceiptStructure(receipt, 'LEGACY_RECEIPT_INVALID');
   if (receipt.sourceKind !== 'csv' || receipt.adapterKind !== 'csv.generic.v1'
-    || receipt.sourceNamespace !== batch.sourceNamespace || receipt.batchId !== batch.batchId
-    || typeof receipt.createdAt !== 'string' || Number.isNaN(Date.parse(receipt.createdAt))) return false;
+    || receipt.sourceNamespace !== batch.sourceNamespace || receipt.batchId !== batch.batchId) {
+    fail('BATCH_ID_COLLISION', 'A batch identifier was reused for different content.');
+  }
+  if (!rejectedCandidateCsvBatchShapeIsPossible(batch)) {
+    fail('LEGACY_RECEIPT_INVALID', 'The persisted legacy receipt cannot represent a Candidate 1 CSV batch.');
+  }
   const legacyBatch = clone(batch);
   // The CSV adapter used producedAt for every observational timestamp, while
   // normal persistence used that same value as the receipt creation time.
@@ -702,7 +895,12 @@ async function matchesRejectedCandidateCsvReceipt(receipt, batch) {
   for (const mutation of legacyBatch.accountMutations) mutation.observedAt = receipt.createdAt;
   for (const mutation of legacyBatch.transactionMutations) mutation.observedAt = receipt.createdAt;
   for (const record of legacyBatch.quarantinedRecords) record.observedAt = receipt.createdAt;
-  return await computeLegacyEnvelopeDigest(legacyBatch) === receipt.payloadDigest;
+  if (await computeLegacyEnvelopeDigest(legacyBatch) !== receipt.payloadDigest) {
+    fail('BATCH_ID_COLLISION', 'A batch identifier was reused for different content.');
+  }
+  if (!provesRejectedCandidateCsvEffects(state, receipt, legacyBatch)) {
+    fail('LEGACY_RECEIPT_EFFECTS_UNVERIFIED', 'Persisted state does not prove that the legacy ingestion batch was applied.');
+  }
 }
 
 export async function reconcileMutationBatch(state, batch, {idFactory = defaultIdFactory, now = batch?.producedAt} = {}) {
@@ -710,13 +908,15 @@ export async function reconcileMutationBatch(state, batch, {idFactory = defaultI
   await validateSourceMutationBatch(batch);
   const priorReceipt = state.domain?.ingestionReceipts?.find(item => item.batchId === batch.batchId);
   if (priorReceipt) {
-    const deterministicReplay = priorReceipt.payloadDigest === batch.payloadDigest
-      || await matchesRejectedCandidateCsvReceipt(priorReceipt, batch);
-    if (!deterministicReplay) fail('BATCH_ID_COLLISION', 'A batch identifier was reused for different content.');
+    if (priorReceipt.payloadDigest === batch.payloadDigest) {
+      assertPersistedReceiptStructure(priorReceipt, 'INGESTION_RECEIPT_INVALID');
+    } else {
+      await assertRejectedCandidateCsvReplay(state, priorReceipt, batch);
+    }
     return {
       state:clone(state),
       changed:false,
-      result:{...clone(priorReceipt.result), status:'already_applied'}
+      result:validatedReplayResult(priorReceipt)
     };
   }
 
