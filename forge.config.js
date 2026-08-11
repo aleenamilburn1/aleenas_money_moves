@@ -2,24 +2,6 @@ import {FusesPlugin} from '@electron-forge/plugin-fuses';
 import {FuseV1Options, FuseVersion} from '@electron/fuses';
 
 const isMacRelease = process.env.MONEY_MOVES_RELEASE === '1';
-const macReleaseSignConfig = {
-  // A generic Developer ID selector keeps the operator/team identity in the
-  // login Keychain instead of source control. `continueOnError:false` is
-  // required so Forge never leaves an unsigned release candidate behind.
-  identity:'Developer ID Application',
-  continueOnError:false,
-  hardenedRuntime:true,
-  strictVerify:true,
-  preAutoEntitlements:false,
-  preEmbedProvisioningProfile:false,
-  optionsForFile:() => ({
-    // Electron needs V8 JIT in its main and helper processes. No device,
-    // sandbox, library-validation, or unsigned-executable-memory exceptions
-    // are granted to this direct-distribution application.
-    entitlements:'build/entitlements/macos-electron.plist',
-    hardenedRuntime:true
-  })
-};
 
 export default {
   // Release output is deliberately isolated from ordinary developer packages.
@@ -57,12 +39,11 @@ export default {
       /^\/js\/vendor\/supabase-js($|\/)/,
       /\.map$/
     ],
-    // These options are deliberately absent for normal development packages.
-    // The release scripts set MONEY_MOVES_RELEASE=1 after Keychain preflight.
-    ...(isMacRelease ? {
-      osxSign:macReleaseSignConfig,
-      osxNotarize:{keychainProfile:'MoneyMovesNotary'}
-    } : {})
+    // Release signing runs after Forge packages the app. The installed
+    // @electron/osx-sign always passes an entitlement plist, including for
+    // native components that must have no entitlement dictionary, so the
+    // release workflow uses the checked-in exact-path codesign policy instead.
+    // Ordinary development packaging remains unsigned and credential-free.
   },
   makers:[
     {name:'@electron-forge/maker-dmg', config:{format:'ULFO', icon:'assets/icons/macos/icon.icns', iconSize:128}},

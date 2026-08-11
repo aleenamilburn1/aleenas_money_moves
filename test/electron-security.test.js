@@ -21,9 +21,11 @@ function pngChunkTypes(png) {
 }
 
 test('Electron main, preload, Forge, and packaged HTML enforce the desktop security baseline', async () => {
-  const [main, preload, forge, html, adapter, restoreCoordinator, startupStatus, startupService, iconSource, icon] = await Promise.all([
-    read('electron/main.js'), read('electron/preload.cjs'), read('forge.config.js'), read('index.html'), read('js/services/desktopVaultRepository.js'),
-    read('js/services/desktopBackupRestore.js'), read('js/startup-status.js'), read('js/services/desktopStartup.js'), readBuffer('assets/brand/money-moves-mark.png'), readBuffer('assets/icons/macos/icon.icns')
+  const [main, preload, forge, signingPolicy, releaseSigner, releasePreflight, html, adapter, restoreCoordinator, startupStatus, startupService, iconSource, icon] = await Promise.all([
+    read('electron/main.js'), read('electron/preload.cjs'), read('forge.config.js'), read('scripts/macos-signing-policy.mjs'),
+    read('scripts/sign-notarize-macos-app.mjs'), read('scripts/prepare-macos-release.mjs'),
+    read('index.html'), read('js/services/desktopVaultRepository.js'), read('js/services/desktopBackupRestore.js'), read('js/startup-status.js'),
+    read('js/services/desktopStartup.js'), readBuffer('assets/brand/money-moves-mark.png'), readBuffer('assets/icons/macos/icon.icns')
   ]);
   for (const setting of ['nodeIntegration:false', 'contextIsolation:true', 'sandbox:true', 'webSecurity:true', 'allowRunningInsecureContent:false', 'experimentalFeatures:false']) assert.match(main, new RegExp(setting));
   assert.match(main, /protocol\.handle\(APP_PROTOCOL/);
@@ -43,11 +45,14 @@ test('Electron main, preload, Forge, and packaged HTML enforce the desktop secur
   assert.match(forge, /maker-dmg/);
   assert.match(forge, /icon:'assets\/icons\/macos\/icon\.icns'/);
   assert.match(forge, /MONEY_MOVES_RELEASE/);
-  assert.match(forge, /identity:'Developer ID Application'/);
-  assert.match(forge, /continueOnError:false/);
-  assert.match(forge, /hardenedRuntime:true/);
-  assert.match(forge, /keychainProfile:'MoneyMovesNotary'/);
-  assert.match(forge, /macos-electron\.plist/);
+  assert.doesNotMatch(forge, /optionsForFile/);
+  assert.match(signingPolicy, /identity = 'Developer ID Application'/);
+  assert.match(signingPolicy, /'--options', 'runtime'/);
+  assert.match(signingPolicy, /args\.push\('--entitlements'/);
+  assert.match(releaseSigner, /notaryProfile = 'MoneyMovesNotary'/);
+  assert.match(releaseSigner, /validateSignedCodePolicies\(app, 'pre-notarization app'\)/);
+  assert.match(releasePreflight, /'--dryrun'/);
+  assert.match(releasePreflight, /'MoneyMovesNotary'/);
   assert.match(forge, /outDir:isMacRelease \? 'out\/macos-release' : 'out'/);
   assert.match(main, /preload\.cjs/);
   assert.doesNotMatch(main, /preload\.js['"`]/);

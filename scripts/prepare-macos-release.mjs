@@ -20,16 +20,26 @@ if (process.env.MONEY_MOVES_RELEASE !== '1') {
 } else if (path.dirname(releaseDirectory) !== expectedParent || !releaseDirectory.startsWith(`${expectedParent}${path.sep}`)) {
   fail('refusing to clear an unexpected release output directory.');
 } else {
+  let identityProbeDirectory;
   try {
+    await fs.mkdir(expectedParent, {recursive:true});
+    identityProbeDirectory = await fs.mkdtemp(path.join(expectedParent, '.identity-probe-'));
+    const identityProbe = path.join(identityProbeDirectory, 'codesign-probe');
     await run('xcrun', ['--find', 'notarytool']);
     // This validates the named Keychain profile without reading or printing any
-    // credential fields. Forge independently fails closed if signing identity
-    // discovery cannot find a Developer ID Application certificate.
+    // credential fields.
     await run('xcrun', ['notarytool', 'history', '--keychain-profile', 'MoneyMovesNotary']);
+    // A dry-run signature confirms that the generic Developer ID selector
+    // resolves and its private key is usable without printing identity output
+    // or persisting certificate metadata.
+    await fs.copyFile('/usr/bin/true', identityProbe);
+    await run('codesign', ['--dryrun', '--force', '--sign', 'Developer ID Application', '--timestamp=none', '--options', 'runtime', identityProbe]);
     await fs.rm(releaseDirectory, {recursive:true, force:true});
     await fs.mkdir(releaseDirectory, {recursive:true});
     process.stdout.write(`Prepared fresh isolated release output: ${path.relative(root, releaseDirectory)}\n`);
   } catch {
-    fail('notarytool or the MoneyMovesNotary Keychain profile is unavailable. No release build was started.');
+    fail('the Developer ID signing identity, notarytool, or MoneyMovesNotary Keychain profile is unavailable. No release build was started.');
+  } finally {
+    if (identityProbeDirectory) await fs.rm(identityProbeDirectory, {recursive:true, force:true});
   }
 }

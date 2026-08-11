@@ -2,213 +2,248 @@
 
 ## Status
 
-**Release-verification remediation complete; independent re-acceptance
-pending.** Independent acceptance rejected the original
-`v2d-macos-release-candidate` at phase 2 for two P1 verifier defects: entitlement
-verification was a text search plus blacklist rather than an exact allowlist,
-and the build-output, DMG, and ZIP apps were not cryptographically bound to one
-candidate. Both defects are remediated and locally verified, but no independent
-acceptance is claimed. This document describes only the release pipeline. It
-does not change product features, encrypted-vault semantics, devotional
-content, transaction behavior, or remote service boundaries.
+**Candidate 3 verified and ready for independent re-acceptance.** A fresh
+ARM64 app, DMG, and ZIP were built from the Candidate 3 source on 2026-08-11.
+The app and final DMG were separately accepted by Apple with zero issues,
+stapled, and validated. Exact component policy, strict codesign, hardened
+runtime, canonical candidate equality, Gatekeeper, package/security scans,
+full regression suites, and the disposable installation matrix all passed.
 
-## Release architecture
+This is a release-candidate result, not independent acceptance. It does not
+change product features, vault authority, migrations, financial behavior, or
+remote-service boundaries.
 
-`forge.config.js` treats `MONEY_MOVES_RELEASE=1` as the only release mode.
-Ordinary `electron:package` and `electron:make` runs retain the prior unsigned
-developer-build behavior and do not access a signing identity or notarization
-credential. Release output is isolated at `out/macos-release`, so it cannot be
-confused with prior development artifacts.
+## Acceptance history and root cause
 
-In release mode, Electron Forge delegates to `@electron/osx-sign` with the
-installed `Developer ID Application` identity selector, validation enabled,
-strict post-sign verification, and `continueOnError:false`. Therefore an
-absent/unusable identity stops the command; it does not produce an unsigned
-candidate. Forge then delegates to `@electron/notarize`, using only the
-Keychain profile name `MoneyMovesNotary`. The profile is resolved by
-`notarytool`; no Apple account, app-specific password, API key, certificate
-export, private key, fingerprint, or team-specific identity string is kept in
-source, logs, environment files, or Git.
+The original `v2d-macos-release-candidate` (`0072b61`) was rejected at
+acceptance phase 2 for two P1 verifier defects:
 
-Electron Forge notarization submits the packaged signed app as a ZIP, waits for
-Apple's result, and staples the accepted ticket to the app before Forge makes
-distribution artifacts. A DMG is a distinct container and cannot inherit that
-app ticket. `notarize-macos-dmg.mjs` therefore submits the finished DMG with
-the same Keychain profile, inspects its issue count, and staples its own ticket.
-A network/error result is a hard failure and leaves no candidate claim.
+1. entitlement verification used text matching and a blacklist instead of an
+   exact structural allowlist; and
+2. the build-output, DMG, and ZIP applications were not cryptographically
+   bound to one candidate payload.
 
-## Hardened runtime and exact entitlement policy
+Candidate 2 (`32347a1`, tag `v2d-macos-release-candidate-2`) corrected those
+two verifier defects but was rejected at mandatory phase 2 for a second P1
+defect. Its component classification granted JIT to every executable not
+recognized as a framework or library. Its test suite explicitly accepted an
+arbitrary `synthetic_tool` as JIT, and Forge's `optionsForFile` callback applied
+the JIT entitlement to all signing targets. The shipped Candidate 2 app
+therefore gave `com.apple.security.cs.allow-jit=true` to native
+`chrome_crashpad_handler` and Squirrel `ShipIt`, even though neither links the
+Electron Framework/V8. This was an actual signed-artifact defect, not merely a
+verifier defect.
 
-Every signed code object uses the hardened runtime. Electron Forge's signing
-callback supplies the checked-in `build/entitlements/macos-electron.plist` to
-executable processes. On current macOS signing tools, library code does not
-receive an entitlement dictionary. The only approved entitlement is:
+The Candidate 2 artifacts must not be relabeled or reused as Candidate 3.
 
-| Entitlement | Why it is present |
-| --- | --- |
-| `com.apple.security.cs.allow-jit` | Electron's V8 engine requires JIT execution in the main and helper processes when the hardened runtime is enabled. |
+## Candidate 3 release architecture
 
-No other entitlement is permitted. In particular the release does **not** grant
-unsigned executable memory, disabled library validation, camera, microphone,
-audio input, location, Bluetooth, USB, printing, App Sandbox, or application
-group access. `preAutoEntitlements` and provisioning-profile embedding are
-disabled because Developer ID direct distribution needs neither and must not
-quietly add a broader entitlement set.
+`MONEY_MOVES_RELEASE=1` remains the only release mode, and release output
+remains isolated at `out/macos-release`. Ordinary `electron:package` and
+`electron:make` remain unsigned and do not access release credentials.
 
-The verifier recursively enumerates 24 signed code paths. Bundle and executable
-paths are both checked intentionally: a bundle path resolves its main binary,
-while explicitly enumerating executable paths prevents nested code from being
-missed by discovery.
+The installed `@electron/osx-sign` implementation always invokes `codesign`
+with an entitlement plist. A local signing probe confirmed that even an empty
+plist creates an actual empty entitlement dictionary. That cannot satisfy the
+Candidate 3 `none` policy, which requires no entitlement dictionary at all.
+Candidate 3 therefore removes Forge's permissive signing/notarization callback
+and uses this release-only sequence:
 
-| Required policy | Signed paths |
-| --- | --- |
-| Exact `com.apple.security.cs.allow-jit = true`, with no additional key | The root `Money Moves.app` and `Contents/MacOS/Money Moves`; all four `Money Moves Helper*.app` bundles and each corresponding `Contents/MacOS` helper executable; Electron's `chrome_crashpad_handler`; and Squirrel's `ShipIt` executable. These are executable processes to which the Forge signing callback supplies the Electron entitlement file. |
-| No entitlement dictionary | `Electron Framework.framework` and its primary `Electron Framework` binary; `libEGL.dylib`, `libGLESv2.dylib`, `libffmpeg.dylib`, and `libvk_swiftshader.dylib`; and the `Mantle.framework`, `ReactiveObjC.framework`, and `Squirrel.framework` bundles plus each primary framework binary. These are libraries; current `codesign` omits library entitlements by design. |
+1. validate Apple-silicon macOS, the generic Developer ID selector, and the
+   `MoneyMovesNotary` Keychain profile without printing identity or credential
+   output;
+2. clear only `out/macos-release` after preflight passes;
+3. let Forge package an unsigned ARM64 application;
+4. independently discover the packaged signed-code targets and require exact
+   equality with the checked-in policy;
+5. sign deepest targets first and the root app last with hardened runtime;
+6. include `--entitlements build/entitlements/macos-electron.plist` only for
+   exact `jit` paths and omit `--entitlements` entirely for `none` paths;
+7. run strict codesign plus exact entitlement verification before any Apple
+   upload;
+8. submit a temporary ZIP of the app with `MoneyMovesNotary`, require
+   `Accepted` and zero log issues, staple, and validate the app;
+9. make DMG and ZIP containers from that stapled app; and
+10. submit the final DMG separately, require `Accepted` and zero log issues,
+    staple, and validate the DMG.
 
-For every path, the verifier extracts the signed DER entitlement slot, converts
-it to an XML property list with the macOS CoreEntitlements tool, parses it
-structurally with `plutil`, and compares the resulting dictionary to the exact
-policy. It fails closed for an unreadable component, malformed entitlement
-data, an extra key, missing JIT, a non-boolean or false JIT value, or any
-entitlement dictionary on a no-entitlement library. It does not use a
-blacklist.
+Every release step fails closed. No Apple account, app-specific password, API
+key, private key, certificate export, fingerprint, or team-specific identity
+is stored in source or release output.
 
-## Trusted-operator release commands
+Apple's successful `notarytool log` response encoded an empty issue list as
+`issues:null`, rather than `issues:[]`. Candidate 3 now accepts only `null`
+(exactly zero issues) or an array (counted exactly); a missing, scalar, or
+otherwise malformed field still fails closed. The already-Accepted app was
+recovered, stapled, and validated without resubmission.
 
-Run from the repository root on an Apple-silicon Mac. The operator must already
-have a usable Developer ID Application certificate/private key in the login
-Keychain and a validated `MoneyMovesNotary` profile in that Keychain. Do not
-place any credential in the command line or an environment file.
+## Explicit pinned signed-component policy
 
-```sh
-CI=true pnpm run check
-CI=true pnpm run electron:test
-CI=true pnpm test
-CI=true pnpm run release:macos
-CI=true pnpm run inspect:package -- out/macos-release
-CI=true pnpm run release:macos:verify
+The checked-in policy contains the exact 24 paths discovered in Electron
+43.3.0's packaged ARM64 app. It has 10 `jit` paths and 14 `none` paths. Bundle
+and main-executable paths are both pinned because codesign accepts both as
+signing targets and the verifier must reject an unexpected target at either
+level.
+
+| Relative path inside `Money Moves.app` | Policy | Technical basis |
+|---|---|---|
+| `.` | `jit` | Root signature for the Electron main application. |
+| `Contents/MacOS/Money Moves` | `jit` | ARM64 process links `@rpath/Electron`; V8 requires JIT under hardened runtime. |
+| `Contents/Frameworks/Money Moves Helper.app` | `jit` | Electron utility helper application bundle. |
+| `Contents/Frameworks/Money Moves Helper.app/Contents/MacOS/Money Moves Helper` | `jit` | ARM64 helper process links `@rpath/Electron`. |
+| `Contents/Frameworks/Money Moves Helper (Renderer).app` | `jit` | Electron renderer helper application bundle. |
+| `Contents/Frameworks/Money Moves Helper (Renderer).app/Contents/MacOS/Money Moves Helper (Renderer)` | `jit` | ARM64 renderer process links `@rpath/Electron`. |
+| `Contents/Frameworks/Money Moves Helper (GPU).app` | `jit` | Electron GPU helper application bundle. |
+| `Contents/Frameworks/Money Moves Helper (GPU).app/Contents/MacOS/Money Moves Helper (GPU)` | `jit` | ARM64 GPU helper process links `@rpath/Electron`. |
+| `Contents/Frameworks/Money Moves Helper (Plugin).app` | `jit` | Electron plugin helper application bundle. |
+| `Contents/Frameworks/Money Moves Helper (Plugin).app/Contents/MacOS/Money Moves Helper (Plugin)` | `jit` | ARM64 plugin helper process links `@rpath/Electron`. |
+| `Contents/Frameworks/Electron Framework.framework` | `none` | Framework bundle, not an executable process entitlement boundary. |
+| `Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework` | `none` | Electron/V8 framework library; JIT belongs to consuming processes, not the library signature. |
+| `Contents/Frameworks/Electron Framework.framework/Versions/A/Helpers/chrome_crashpad_handler` | `none` | Native Crashpad tool; links native macOS frameworks and does not link Electron. |
+| `Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libEGL.dylib` | `none` | Native dynamic library. |
+| `Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libGLESv2.dylib` | `none` | Native dynamic library. |
+| `Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libffmpeg.dylib` | `none` | Native dynamic library. |
+| `Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libvk_swiftshader.dylib` | `none` | Native dynamic library. |
+| `Contents/Frameworks/Mantle.framework` | `none` | Native framework bundle. |
+| `Contents/Frameworks/Mantle.framework/Versions/A/Mantle` | `none` | Native framework library. |
+| `Contents/Frameworks/ReactiveObjC.framework` | `none` | Native framework bundle. |
+| `Contents/Frameworks/ReactiveObjC.framework/Versions/A/ReactiveObjC` | `none` | Native framework library. |
+| `Contents/Frameworks/Squirrel.framework` | `none` | Native framework bundle. |
+| `Contents/Frameworks/Squirrel.framework/Versions/A/Squirrel` | `none` | Native framework library. |
+| `Contents/Frameworks/Squirrel.framework/Versions/A/Resources/ShipIt` | `none` | Native Squirrel tool; links AppKit/Foundation/Mantle/ReactiveObjC, not Electron. |
+
+There is no fallback policy. In particular, `unknown executable => jit` no
+longer exists.
+
+## Fail-closed discovery and entitlement enforcement
+
+The verifier independently walks the final application without following
+symlinks. It discovers the root app, nested code bundles, executable files,
+dynamic/native modules, and Mach-O files. Discovery does not assign an
+entitlement based on extension, executable mode, or a default branch. It first
+requires exact path-set equality with the pinned policy and rejects:
+
+- an unknown executable or nested code bundle;
+- a missing helper, tool, library, framework, or other expected path;
+- a duplicate or ambiguous discovered path;
+- an unreadable directory, file, signature, or entitlement slot; and
+- a component moved to an unexpected relative path.
+
+Only after equality succeeds does each path receive its pinned `jit` or `none`
+policy.
+
+For `jit`, DER entitlement output must parse to exactly:
+
+```json
+{"com.apple.security.cs.allow-jit":true}
 ```
 
-`release:macos` first validates that the host is Darwin/arm64 and that
-`notarytool` can use `MoneyMovesNotary`; it clears only
-`out/macos-release`, builds fresh ARM64 output, signs, notarizes, waits, and
-staples the app, then separately notarizes and staples the finished DMG. An
-unavailable Keychain profile prevents packaging. A missing or unusable signing
-identity causes Forge signing to fail closed.
+No additional key is allowed. For `none`, the DER entitlement slot must be
+absent; an empty dictionary also fails. Malformed output, missing or false JIT,
+an extra entitlement, or any dictionary on a `none` component fails closed.
+Every discovered component must also show hardened runtime, and the app must
+pass strict deep codesign verification.
 
-When diagnosing a network-interrupted upload, inspect status without exposing
-credentials:
+## Adversarial and regression verification
 
-```sh
-xcrun notarytool history --keychain-profile MoneyMovesNotary --output-format json
-xcrun notarytool log SUBMISSION_ID --keychain-profile MoneyMovesNotary
-```
+The combined focused release suites pass **32/32** tests. Coverage includes:
 
-Only retrieve the log after the submission has reached a final status. Treat
-every warning or error as a release finding. Do not publish the submission ID
-or log if it contains material that should remain private.
+- complete exact component-set and exact JIT/no-entitlement pass cases;
+- unknown executable and unknown nested component;
+- missing nested executable and missing helper;
+- duplicate/ambiguous discovery;
+- component moved to an unexpected path;
+- Crashpad/native JIT and arbitrary native entitlement;
+- missing JIT, `allow-jit=false`, and extra JIT-process entitlement;
+- malformed entitlement output and unreadable required component; and
+- Candidate 2's canonical manifest/provenance tests for identical, modified,
+  added, removed, and symlink-changed application payloads plus deterministic
+  artifact discovery.
 
-## Verification and inspection
+The prior test that accepted `synthetic_tool => jit` has been reversed: the
+same arbitrary executable now causes exact-set rejection.
 
-`release:macos:verify` requires all of the following and exits non-zero for
-any failure:
+Final validation completed on 2026-08-11:
 
-- signed `Money Moves.app`, `.dmg`, and `.zip` in the isolated release output;
-- ARM64-only application executable and package version metadata matching
-  `2.0.0-desktop.0`;
-- `codesign --verify --deep --strict --verbose=2` success;
-- a hardened-runtime signature and the per-component exact entitlement policy;
-- independently generated canonical manifests proving that the build-output,
-  mounted-DMG, and extracted-ZIP apps are the same candidate;
-- `xcrun stapler validate` success for both the app and DMG; and
-- `spctl --assess --type execute --verbose=4` success for the app.
+- `CI=true pnpm run check`: passed.
+- focused artifact/signing/verifier/security suites: 32 passed, 0 failed, 0
+  skipped.
+- `CI=true pnpm test`: 229 passed, 0 failed, 0 skipped.
+- `CI=true pnpm run electron:test`: 38 passed, 0 failed, 0 skipped.
+- `CI=true pnpm run inspect:package -- out/macos-release`: passed (289 files
+  and 49 archive entries).
+- `CI=true pnpm run release:macos:verify`: passed, including the security scan.
 
-The canonical application manifest is deterministic line-delimited JSON in
-bytewise relative-path order. It records every directory, every regular file's
-relative path, POSIX mode, size, and SHA-256 digest, and every symlink's path
-and literal target. Symlinks are never followed. Directory entries make added
-or removed empty directories visible. The manifest excludes timestamps,
-ownership, ACLs, and extended attributes because read-only DMG mounting and
-ZIP extraction cannot preserve those consistently and they are not shipped
-file payload. The verifier compares the canonical manifests exactly and reports
-only added/removed/changed entry counts on mismatch, never file contents. It
-also records SHA-256 provenance for the final DMG and ZIP containers.
+No schema, migration, product behavior, vault, transaction, allocation,
+devotional, UI, backup/restore, Plaid, or remote-service change was made.
 
-`inspect:package -- out/macos-release` scans packaged filesystem and ASAR
-content for excluded research/test material, forbidden source/config files,
-unsafe image metadata, the empty bootstrap seed, and required desktop
-components. `scan-macos-release.mjs` checks the release output and root for
-private-key markers, credential/token material, and unexpected `.env` files;
-it reports only pass/fail, never matched values. Its final result, the Git diff
-review, and a manual confirmation that no local paths, vaults, financial data,
-or sensitive diagnostics entered generated output are required before a
-candidate commit.
+## Candidate 3 release evidence — 2026-08-11
 
-## Artifact locations and installation matrix
+Preflight confirmed repository integrity, a usable generic Developer ID
+Application private key, and authenticated `MoneyMovesNotary` access without
+printing identity or credential material. The build cleared only
+`out/macos-release`; no Candidate 2 artifact was reused.
 
-Expected outputs after a passing release command:
+- App notarization: `Accepted`, 0 issues, submission
+  `9a5cb3e6-c343-4d75-a4c7-cfbb383dd5ef`; stapled and validated.
+- DMG notarization: `Accepted`, 0 issues, submission
+  `32ce4a00-4a18-403f-af72-09cd30ff6e33`; separately stapled and validated.
+- Signed component set: exactly 24 paths; 10 `jit` and 14 `none`.
+- Crashpad and ShipIt: hardened runtime with no entitlement dictionary.
+- Framework bundles, framework executables, and dynamic libraries: hardened
+  runtime with no entitlement dictionary.
+- Main app/process and four helper bundle/process pairs: hardened runtime with
+  exactly `com.apple.security.cs.allow-jit=true` and no additional key.
+- Strict deep codesign and Gatekeeper: passed.
+- App architecture and both version fields: exact ARM64 and
+  `2.0.0-desktop.0`.
+- Build-output, read-only-DMG, and extracted-ZIP canonical manifests: exactly
+  equal.
+- Canonical app-manifest SHA-256:
+  `62802941b8661d2b46e2dc1e6f6b406b2f603bf69d3a28b3f93e23ca153af346`.
+- DMG SHA-256:
+  `88c6e063bec862e890c6cd89b09bd09a657f66a61b900ef293c45d2b8a70cd42`.
+- ZIP SHA-256:
+  `60cf80212d7cda34e04cfbd3dc024e60012e9080290e05f06d3a80f73cd35aac`.
 
-- `out/macos-release/Money Moves-darwin-arm64/Money Moves.app`
-- `out/macos-release/make/Money Moves-2.0.0-desktop.0-arm64.dmg`
-- `out/macos-release/make/zip/darwin/arm64/Money Moves-darwin-arm64-2.0.0-desktop.0.zip`
+Electron Forge's deterministic output paths are:
 
-Use a disposable synthetic profile by redirecting the test app's user-data
-location; never use, rename, reset, or inspect the founder's real Money Moves
-Application Support directory. The required manual matrix is:
+- `out/macos-release/Money Moves-darwin-arm64/Money Moves.app`;
+- `out/macos-release/make/Money Moves-2.0.0-desktop.0-arm64.dmg`; and
+- `out/macos-release/make/zip/darwin/arm64/Money Moves-darwin-arm64-2.0.0-desktop.0.zip`.
 
-1. launch the signed build-output app;
-2. mount the DMG, copy the app to `/Applications`, eject the DMG, and launch
-   the installed copy;
-3. create a synthetic vault; lock/unlock it; exercise V2B workflows, Faith &
-   Money devotionals, and backup/restore entry points;
-4. quit/reopen the installed app and confirm the synthetic vault persists; and
-5. confirm Gatekeeper shows neither an unidentified-developer nor damaged-app
-   warning.
+The verifier searches only inside `out/macos-release`, requires exactly one
+expected app, DMG, and nested Forge ZIP, and rejects absent or ambiguous
+matches. The package inspector also handles pnpm's literal `--` argument
+separator before the explicit output path. The final release scan found no
+credentials, private keys, Plaid tokens, user financial-data indicators, or
+unexpected environment files.
 
-## Remediation verification record — 2026-08-10
+The disposable matrix created a new profile under `/private/tmp`. The direct
+build app and a read-only-DMG copy installed temporarily at
+`/Applications/Money Moves V2D Candidate 3.app` both passed fresh vault,
+lock/unlock, V2B review, Faith & Money, backup/restore entry points,
+quit/reopen, and persistence. The installed candidate passed strict codesign,
+Gatekeeper, and LaunchServices launch without an unidentified-developer or
+damaged-app block. Localhost remote debugging was enabled only on these
+disposable processes. The candidate app, profile, processes, and mount were
+removed afterward. `/Applications/Money Moves.app` remained present, and the
+founder's normal Application Support data was not accessed or modified.
 
-- Independent acceptance rejected the original candidate for the two P1
-  verifier defects described in Status. Acceptance stopped at phase 2; no V2D
-  acceptance commit or tag exists.
-- The previously accepted packaged-app and DMG Apple submissions remain the
-  provenance of the existing artifacts. The existing app, DMG, and ZIP were
-  reused unchanged: no rebuild, re-sign, artifact-content change, notarization
-  resubmission, or Apple credential operation occurred during remediation.
-- `CI=true pnpm run release:macos:verify` passed. The build-output, mounted-DMG,
-  and extracted-ZIP canonical manifests matched exactly at application-manifest
-  SHA-256 `be72d3f7c0023be535d6a4da203ee03d1099563fd890b29db7335ad54ed51e24`.
-- Container provenance is DMG SHA-256
-  `d208ef10ecbe3aa05a43f3eab136f2fe495c05d2d0eafb35a905eb7d592f47dc`
-  and ZIP SHA-256
-  `be150085da934a31ba3426fc76b402fef6e0c90b53f01b43c17f75eacfec98c0`.
-- Exact entitlement validation passed for all 24 enumerated signed code paths.
-  Strict deep signing passed for the build-output, DMG, and ZIP apps; hardened
-  runtime passed; app and DMG stapling passed; and Gatekeeper accepted the app
-  as Notarized Developer ID software.
-- The release security scan passed. `CI=true pnpm run inspect:package --
-  out/macos-release` passed with 287 filesystem files and 49 ASAR entries.
-- Adversarial tests exercise the reusable verifier functions and pass the exact
-  JIT-only case; arbitrary and known-dangerous extra entitlements; missing or
-  false JIT; malformed plist output; the no-entitlement policy; identical
-  candidates; stale same-version/signature-metadata payloads; modified, added,
-  and removed files; changed symlink targets; and missing/ambiguous artifacts.
-- `CI=true pnpm run check` passed. `CI=true pnpm test` passed 210 tests with
-  zero failures or skips. `CI=true pnpm run electron:test` passed 38 tests with
-  zero failures or skips.
-- The remediation did not access or modify `/Applications/Money Moves.app` or
-  any Money Moves Application Support data.
+## Historical Candidate 2 provenance — not valid for Candidate 3
 
-No independent acceptance is claimed. The remediation candidate is ready for a
-fresh independent acceptance run from phase 1.
+Candidate 2 previously recorded application-manifest SHA-256
+`be72d3f7c0023be535d6a4da203ee03d1099563fd890b29db7335ad54ed51e24`,
+DMG SHA-256
+`d208ef10ecbe3aa05a43f3eab136f2fe495c05d2d0eafb35a905eb7d592f47dc`,
+and ZIP SHA-256
+`be150085da934a31ba3426fc76b402fef6e0c90b53f01b43c17f75eacfec98c0`.
+Those values describe the rejected excessive-JIT artifacts and must never be
+reported as Candidate 3 provenance.
 
-## Known operational risks
+## Next gate
 
-- Apple processing time and network availability are external dependencies.
-  Preserve the submission ID, wait for a final Apple status, retrieve a failed
-  submission's log, and do not declare success from a local upload alone.
-- macOS may ask the trusted release operator to unlock the login Keychain for
-  `codesign`. The password is the macOS login/Keychain password; it must never
-  be supplied to Codex, a shell command, Git, or this repository.
-- Signing the Electron framework contains many nested components and can take
-  several minutes. Keep the release terminal and network connection available
-  until Forge returns a final result.
+The verified implementation is the `Restrict macOS JIT signing policy`
+candidate commit with annotated tag `v2d-macos-release-candidate-3`. Run
+independent re-acceptance against that immutable tag. Do not create a V2D
+accepted tag from this implementation task.

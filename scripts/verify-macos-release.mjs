@@ -6,10 +6,14 @@ import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {execFile, spawnSync} from 'node:child_process';
 import {promisify} from 'node:util';
+import {
+  entitlementPolicies,
+  signedComponentPolicy
+} from './macos-signing-policy.mjs';
 
 const run = promisify(execFile);
 export const expectedVersion = '2.0.0-desktop.0';
-export const entitlementPolicies = Object.freeze({jitOnly:'jit-only', none:'none'});
+export {entitlementPolicies};
 export const approvedJitEntitlements = Object.freeze({'com.apple.security.cs.allow-jit':true});
 
 function releaseError(message) {
@@ -204,7 +208,7 @@ export function validateEntitlementDictionary(entitlements, policy, label = 'sig
     if (entitlements !== null) throw releaseError(`${label} must not contain an entitlement dictionary.`);
     return;
   }
-  if (policy !== entitlementPolicies.jitOnly) throw releaseError(`unknown entitlement policy for ${label}.`);
+  if (policy !== entitlementPolicies.jit) throw releaseError(`unknown entitlement policy for ${label}.`);
   if (entitlements === null) throw releaseError(`${label} is missing the required JIT entitlement.`);
   if (!entitlements || typeof entitlements !== 'object' || Array.isArray(entitlements)) {
     throw releaseError(`${label} entitlement data is not a dictionary.`);
@@ -219,44 +223,50 @@ export function validateEntitlementDictionary(entitlements, policy, label = 'sig
   }
 }
 
-function isFrameworkMainExecutable(relativePath) {
-  const parts = relativePath.split('/');
-  if (parts.length < 4) return false;
-  const versionIndex = parts.lastIndexOf('Versions');
-  if (versionIndex < 1 || versionIndex !== parts.length - 3) return false;
-  const framework = parts[versionIndex - 1];
-  return framework.endsWith('.framework') && parts.at(-1) === framework.slice(0, -'.framework'.length);
-}
+const codeBundleSuffixes = Object.freeze(['.app', '.framework', '.xpc', '.appex', '.bundle']);
+const machOMagic = new Set([
+  'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
+  'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'
+]);
 
-function entitlementPolicyFor(relativePath, kind) {
-  if (kind === 'application') return entitlementPolicies.jitOnly;
-  if (kind === 'framework' || /\.(dylib|node|so)$/.test(relativePath) || isFrameworkMainExecutable(relativePath)) {
-    return entitlementPolicies.none;
+async function isMachO(target, relativePath) {
+  let handle;
+  try {
+    handle = await fs.open(target, 'r');
+    const magic = Buffer.alloc(4);
+    const {bytesRead} = await handle.read(magic, 0, magic.length, 0);
+    return bytesRead === magic.length && machOMagic.has(magic.toString('hex'));
+  } catch {
+    throw releaseError(`unable to inspect potential signed component: ${relativePath}.`);
+  } finally {
+    await handle?.close();
   }
-  return entitlementPolicies.jitOnly;
 }
 
-export async function discoverSignedComponents(app) {
-  const components = [{path:app, relativePath:'.', kind:'application', policy:entitlementPolicies.jitOnly}];
+export async function enumerateSignedComponents(app) {
+  const components = [{path:app, relativePath:'.', discoveredKind:'application'}];
 
   async function visit(directory) {
-    const entries = await fs.readdir(directory, {withFileTypes:true});
+    let entries;
+    try { entries = await fs.readdir(directory, {withFileTypes:true}); }
+    catch { throw releaseError(`unable to enumerate signed components under ${normalizedRelative(app, directory) || '.'}.`); }
     entries.sort((left, right) => comparePaths(left.name, right.name));
     for (const entry of entries) {
       const target = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       const relativePath = normalizedRelative(app, target);
       if (entry.isDirectory()) {
-        let kind = null;
-        if (entry.name.endsWith('.app')) kind = 'application';
-        else if (entry.name.endsWith('.framework')) kind = 'framework';
-        else if (entry.name.endsWith('.xpc') || entry.name.endsWith('.appex')) kind = 'service';
-        if (kind) components.push({path:target, relativePath, kind, policy:entitlementPolicyFor(relativePath, kind)});
+        const suffix = codeBundleSuffixes.find(candidate => entry.name.endsWith(candidate));
+        if (suffix) components.push({
+          path:target,
+          relativePath,
+          discoveredKind:suffix === '.app' ? 'application' : suffix.slice(1)
+        });
         await visit(target);
       } else if (entry.isFile()) {
         const stat = await fs.lstat(target);
-        if ((stat.mode & 0o111) !== 0 || /\.(dylib|node|so)$/.test(entry.name)) {
-          components.push({path:target, relativePath, kind:'executable', policy:entitlementPolicyFor(relativePath, 'executable')});
+        if ((stat.mode & 0o111) !== 0 || /\.(dylib|node|so)$/.test(entry.name) || await isMachO(target, relativePath)) {
+          components.push({path:target, relativePath, discoveredKind:'executable'});
         }
       }
     }
@@ -265,6 +275,42 @@ export async function discoverSignedComponents(app) {
   await visit(app);
   components.sort((left, right) => comparePaths(left.relativePath, right.relativePath));
   return components;
+}
+
+export function requireExactSignedComponentSet(discovered) {
+  const byPath = new Map();
+  const duplicates = new Set();
+  for (const component of discovered) {
+    if (byPath.has(component.relativePath)) duplicates.add(component.relativePath);
+    else byPath.set(component.relativePath, component);
+  }
+  if (duplicates.size) {
+    throw releaseError(`duplicate or ambiguous signed component discovery: ${[...duplicates].sort(comparePaths).join(', ')}.`);
+  }
+
+  const expectedPaths = new Set(signedComponentPolicy.map(entry => entry.relativePath));
+  const actualPaths = new Set(byPath.keys());
+  const unknown = [...actualPaths].filter(relativePath => !expectedPaths.has(relativePath)).sort(comparePaths);
+  const missing = [...expectedPaths].filter(relativePath => !actualPaths.has(relativePath)).sort(comparePaths);
+  if (unknown.length || missing.length) {
+    const details = [];
+    if (unknown.length) details.push(`unknown=${unknown.join(', ')}`);
+    if (missing.length) details.push(`missing=${missing.join(', ')}`);
+    throw releaseError(`signed component set does not match the pinned policy (${details.join('; ')}).`);
+  }
+
+  const kindMismatches = signedComponentPolicy
+    .filter(entry => byPath.get(entry.relativePath).discoveredKind !== entry.kind)
+    .map(entry => `${entry.relativePath} expected=${entry.kind} actual=${byPath.get(entry.relativePath).discoveredKind}`);
+  if (kindMismatches.length) {
+    throw releaseError(`signed component kinds do not match the pinned policy (${kindMismatches.join('; ')}).`);
+  }
+
+  return signedComponentPolicy.map(entry => ({...byPath.get(entry.relativePath), ...entry}));
+}
+
+export async function discoverSignedComponents(app) {
+  return requireExactSignedComponentSet(await enumerateSignedComponents(app));
 }
 
 async function extractEntitlementDictionary(component, label) {
@@ -292,15 +338,23 @@ async function extractEntitlementDictionary(component, label) {
   }
 }
 
-async function validateSignedCodePolicies(app, label) {
+export async function validateSignedCodePolicies(app, label, {
+  inspectSignature = component => commandOutput('codesign', ['-d', '--verbose=2', component]),
+  inspectEntitlements = (component, componentLabel) => extractEntitlementDictionary(component, componentLabel)
+} = {}) {
   const components = await discoverSignedComponents(app);
   for (const component of components) {
     const componentLabel = `${label} ${component.relativePath}`;
     let signature;
-    try { signature = await commandOutput('codesign', ['-d', '--verbose=2', component.path]); }
+    try { signature = await inspectSignature(component.path, componentLabel, component); }
     catch { throw releaseError(`unable to inspect required signed component: ${componentLabel}.`); }
     if (!signature.includes('runtime')) throw releaseError(`hardened runtime is absent from ${componentLabel}.`);
-    const entitlements = await extractEntitlementDictionary(component.path, componentLabel);
+    let entitlements;
+    try { entitlements = await inspectEntitlements(component.path, componentLabel, component); }
+    catch (error) {
+      if (error?.message?.includes(componentLabel)) throw error;
+      throw releaseError(`unable to inspect entitlements for ${componentLabel}.`);
+    }
     validateEntitlementDictionary(entitlements, component.policy, componentLabel);
   }
   return components;
