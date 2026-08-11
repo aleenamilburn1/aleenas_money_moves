@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test, {beforeEach} from 'node:test';
+import {SYSTEM_BUCKET_IDS} from '../js/domain/constants.js';
 import {migrateState} from '../js/domain/migrations.js';
 import {validateAllocation} from '../js/domain/models.js';
 import {
@@ -210,4 +211,55 @@ test('unassigned transactions remain empty and inflows use positive allocation m
   await saveAllocationDraft(state, inflow.id, [row('inflow-allocation', 'travel', 2500)], async()=>{}, {now});
   assert.equal(state.domain.transactions.find(item=>item.id===inflow.id).amountCents, 2500);
   assert.equal(state.domain.allocations.find(item=>item.transactionId===inflow.id).amountCents, 2500);
+});
+
+test('system classifications never rewrite canonical signed source cents', async () => {
+  for (const amountCents of [1250, -1250]) {
+    for (const bucketId of [...Object.values(SYSTEM_BUCKET_IDS), 'food']) {
+      const state = migrated();
+      const transaction = {
+        id:`source-${amountCents}-${bucketId}`,
+        accountId:'unknown-account', source:'csv', sourceTransactionId:`external-${amountCents}-${bucketId}`,
+        rawName:'Source movement', merchantName:'Source movement', amountCents, currency:'USD', authorizedAt:null,
+        postedAt:'2026-07-31', displayDate:'2026-07-31', pendingStatus:'posted', movementType:'unclassified',
+        reviewStatus:'pending', locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null,
+        manualOverrides:null, createdAt:now, updatedAt:now
+      };
+      state.domain.transactions.push(transaction);
+      await saveAllocationDraft(
+        state,
+        transaction.id,
+        [row(`allocation-${amountCents}-${bucketId}`, bucketId, 1250)],
+        async()=>{},
+        {now, markReviewed:true}
+      );
+      assert.equal(state.domain.transactions.find(item => item.id === transaction.id).amountCents, amountCents);
+    }
+  }
+});
+
+test('reimbursement and refund interpretation with allocation/review changes preserves source cents', async () => {
+  for (const amountCents of [1250, -1250]) {
+    for (const movementType of ['reimbursement', 'merchant_refund']) {
+      const state = migrated();
+      const transaction = {
+        id:`interpreted-${amountCents}-${movementType}`,
+        accountId:'unknown-account', source:'csv', sourceTransactionId:`external-${amountCents}-${movementType}`,
+        rawName:'Interpreted movement', merchantName:'Interpreted movement', amountCents, currency:'USD', authorizedAt:null,
+        postedAt:'2026-07-31', displayDate:'2026-07-31', pendingStatus:'posted', movementType,
+        reviewStatus:'pending', locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null,
+        manualOverrides:null, createdAt:now, updatedAt:now
+      };
+      state.domain.transactions.push(transaction);
+      await saveAllocationDraft(
+        state,
+        transaction.id,
+        [row(`interpreted-allocation-${amountCents}-${movementType}`, 'food', 1250, {ownershipType:'reimbursable'})],
+        async()=>{},
+        {now, markReviewed:true}
+      );
+      assert.equal(state.domain.transactions.find(item => item.id === transaction.id).amountCents, amountCents);
+      assert.equal(state.domain.transactions.find(item => item.id === transaction.id).reviewStatus, 'reviewed');
+    }
+  }
 });

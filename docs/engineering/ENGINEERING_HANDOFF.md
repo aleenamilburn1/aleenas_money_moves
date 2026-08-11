@@ -14,7 +14,7 @@
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
 - V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
 - V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Candidate 2 is independently accepted by `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`; annotated tag `v3-plaid-architecture-accepted` identifies the documentation-only acceptance checkpoint.
-- V3A provider-neutral ingestion is implemented from the accepted architecture checkpoint and awaits independent acceptance. The annotated `v3a-provider-neutral-ingestion-candidate` tag identifies the candidate. It adds schema 10 and offline canonical ingestion only; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
+- V3A provider-neutral ingestion Candidate 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`) was rejected by independent acceptance. Its annotated `v3a-provider-neutral-ingestion-candidate` tag remains preserved. The narrow remediation retains schema 10 and is identified by the new annotated `v3a-provider-neutral-ingestion-candidate-2` tag after all gates pass. Candidate 2 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
 
 ## Desktop foundation
 
@@ -225,31 +225,57 @@ Known removals retain canonical rows and user evidence; unknown removals retain
 source tombstones. Same-key replay is idempotent, while semantic lookalikes are
 never merged.
 
+Independent acceptance rejected Candidate 1 for four reproduced defects:
+volatile observation time changed the CSV batch digest; account scope was absent
+from transaction source identity; classified/reviewed amount changes without
+allocations could bypass resolution; and system classification could rewrite
+canonical signed cents. Candidate 2 corrects only those defects and their
+direct regression surface.
+
+Batch receipts now use a semantic source/content digest that excludes
+`producedAt`, the observation envelope, and per-item observation timestamps.
+Those fields remain validated observability metadata. Exact later reimport and
+persistence retry reuse one deterministic receipt, while changed source
+account, amount, reference, checkpoint, or order still collides. Existing
+Candidate 1 CSV receipts are recognized only through an exact reconstruction of
+the old timestamp-bound envelope; changed content remains fail-closed.
+
+Canonical transaction identity is now
+`sourceKind + sourceNamespace + sourceAccountRef + sourceRecordRef`. This uses
+schema-10 fields already present, including for external-ID and fallback CSV
+references, and the schema-9→10 migration is corrected in place. One shared
+interpretation predicate covers classification, review state, allocations,
+notes, overrides, and reimbursement-payment use for both ordinary modifications
+and pending-to-posted changes. Allocation/review workflows never assign to
+source-owned `amountCents`.
+
 The existing CSV entry point now uses the canonical batch path. No new Reports,
 quarantine, or conflict-resolution screen was added. No provider product,
 network, backend, token, credential, cursor, webhook, FX, or hosted persistence
 exists in V3A. Quarter boundaries retain detailed source and user history for a
 future local V3R phase without implementing report calculations or snapshots.
 
-Fresh candidate validation passed:
+Fresh remediation validation passed:
 
 - `CI=true pnpm run check`: passed.
-- `CI=true pnpm test`: 261 passed, 0 failed, 0 skipped, 0 todo.
+- `CI=true pnpm test`: 271 passed, 0 failed, 0 skipped, 0 todo.
 - `CI=true pnpm run electron:test`: 38 passed, 0 failed, 0 skipped, 0 todo.
-- Focused V3A suite: 32 passed, 0 failed, 0 skipped, 0 todo.
+- Focused V3A suite: 40 passed, 0 failed, 0 skipped, 0 todo.
 - `git diff --check` and the forbidden-capability/security scans: passed.
 
-These are implementation results, not independent acceptance. The candidate is
-identified by annotated tag `v3a-provider-neutral-ingestion-candidate`; V3B may
-begin only after a separate V3A review records acceptance.
+These are implementation results, not independent acceptance. Candidate 1 and
+its annotated tag remain intact; the remediation is identified by annotated tag
+`v3a-provider-neutral-ingestion-candidate-2`. V3B may begin only after a new,
+separate V3A review records re-acceptance.
 
 ## Recommended next task
 
-Open a bounded independent V3A acceptance task from the candidate tag. Re-read
+Open a new bounded independent V3A re-acceptance task from
+`v3a-provider-neutral-ingestion-candidate-2`. Re-read
 the PRD, all four V3 architecture documents, the architecture acceptance, and
 the V3A implementation report; independently review schema-9 migration, source
 identity, exact money, ownership, reconciliation, atomic persistence, backup,
-history retention, and scope/privacy boundaries. Repeat the 261-unit and
+history retention, and scope/privacy boundaries. Repeat the 271-unit and
 38-Electron gates and record acceptance or rejection separately. Do not begin
 V3B, V3C, V3D, V3R, or V3E until each preceding phase receives its own
 implementation and independent acceptance. The remaining human Finder/Dock/

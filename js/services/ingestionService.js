@@ -1,5 +1,5 @@
 import {STATE_SCHEMA_VERSION, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
-import {stableCanonicalJson, validateSourceMutationBatch} from '../domain/ingestionContract.js';
+import {computeLegacyEnvelopeDigest, stableCanonicalJson, validateSourceMutationBatch} from '../domain/ingestionContract.js';
 import {isAllocationActive, validateDomainStore} from '../domain/models.js';
 import {advanceStateRevision} from './stateRevision.js';
 
@@ -35,6 +35,10 @@ function sourceKey(sourceKind, sourceNamespace, sourceRef) {
   return `${sourceKind}\u001f${sourceNamespace}\u001f${sourceRef}`;
 }
 
+function transactionSourceKey(sourceKind, sourceNamespace, sourceAccountRef, sourceRecordRef) {
+  return `${sourceKind}\u001f${sourceNamespace}\u001f${sourceAccountRef}\u001f${sourceRecordRef}`;
+}
+
 function ensureCollections(domain) {
   for (const field of [
     'ingestionReceipts', 'sourceQuarantines', 'sourceTombstones', 'interpretationConflicts', 'sourceAuditEvents'
@@ -51,9 +55,19 @@ function transactionIndex(domain) {
   const result = new Map();
   for (const transaction of domain.transactions) {
     if (!transaction.sourceKind) continue;
-    result.set(sourceKey(transaction.sourceKind, transaction.sourceNamespace, transaction.sourceRecordRef), {transaction, alias:null});
+    result.set(transactionSourceKey(
+      transaction.sourceKind,
+      transaction.sourceNamespace,
+      transaction.sourceAccountRef,
+      transaction.sourceRecordRef
+    ), {transaction, alias:null});
     for (const alias of transaction.sourceRefAliases || []) {
-      result.set(sourceKey(transaction.sourceKind, transaction.sourceNamespace, alias.sourceRecordRef), {transaction, alias});
+      result.set(transactionSourceKey(
+        transaction.sourceKind,
+        transaction.sourceNamespace,
+        transaction.sourceAccountRef,
+        alias.sourceRecordRef
+      ), {transaction, alias});
     }
   }
   return result;
@@ -299,20 +313,15 @@ function applyRecordToTransaction(domain, transaction, mutation, batch, context,
   if (sourceFactsEqual(transaction, record)) return false;
   const changedFields = sourceChangedFields(transaction, record);
   const activeAllocations = domain.allocations.filter(item => item.transactionId === transaction.id && isAllocationActive(item));
-  const allocationTotal = activeAllocations.reduce((sum, item) => sum + item.amountCents, 0);
-  const incompatible = activeAllocations.length > 0 && (
-    allocationTotal !== Math.abs(record.amountCents)
-    || Math.sign(transaction.amountCents) !== Math.sign(record.amountCents)
-    || transaction.currency !== record.currency
-  );
+  const requiresInterpretationReview = sourceAmountChangeRequiresInterpretationReview(domain, transaction, record);
   transaction.sourceHistory.push(historySnapshot(transaction, batch, mutation.observedAt));
-  if (incompatible) {
+  if (requiresInterpretationReview) {
     const existingConflictId = transaction.interpretationConflictId;
     createInterpretationConflict(domain, transaction, batch, context, {
       kind:'source_amount_changed',
       nextAmountCents:record.amountCents,
       nextCurrency:record.currency,
-      supersedeAllocations:true
+      supersedeAllocations:activeAllocations.length > 0
     });
     if (!existingConflictId && transaction.interpretationConflictId) counts.interpretationConflicts += 1;
   }
@@ -433,7 +442,7 @@ function applyOrdinaryTransactionMutations(state, domain, batch, context, accoun
   for (const mutation of ordinary) {
     const account = resolveLocalAccount(domain, batch, mutation.sourceAccountRef, accounts);
     if (!account) fail('MISSING_LOCAL_ACCOUNT', 'A transaction does not resolve to a local account.');
-    const key = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceRecordRef);
+    const key = transactionSourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef);
     const existing = transactions.get(key)?.transaction || null;
     if (mutation.kind === 'add') {
       if (!existing) {
@@ -473,7 +482,7 @@ function applyPendingPostedTransitions(state, domain, batch, context, accounts, 
     const account = resolveLocalAccount(domain, batch, mutation.sourceAccountRef, accounts);
     if (!account) fail('MISSING_LOCAL_ACCOUNT', 'A posted transaction does not resolve to a local account.');
     if (mutation.record.lifecycle !== 'posted') fail('INVALID_PREDECESSOR_TRANSITION', 'Only a posted record may replace a predecessor.');
-    const postedKey = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceRecordRef);
+    const postedKey = transactionSourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef);
     const existingPosted = transactions.get(postedKey);
     if (existingPosted) {
       const hasExpectedAlias = !existingPosted.alias && (existingPosted.transaction.sourceRefAliases || [])
@@ -486,9 +495,22 @@ function applyPendingPostedTransitions(state, domain, batch, context, accounts, 
       }
       continue;
     }
-    const predecessorKey = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.record.predecessorSourceRef);
+    const predecessorKey = transactionSourceKey(
+      batch.sourceKind,
+      batch.sourceNamespace,
+      mutation.sourceAccountRef,
+      mutation.record.predecessorSourceRef
+    );
     const predecessorEntry = transactions.get(predecessorKey);
-    if (!predecessorEntry || predecessorEntry.alias) fail('MISSING_PREDECESSOR', 'The explicit predecessor does not resolve to one current transaction.');
+    if (!predecessorEntry || predecessorEntry.alias) {
+      const crossAccountPredecessor = [...transactions.values()].some(entry => entry.transaction.sourceAccountRef !== mutation.sourceAccountRef
+        && (entry.transaction.sourceRecordRef === mutation.record.predecessorSourceRef
+          || (entry.transaction.sourceRefAliases || []).some(alias => alias.sourceRecordRef === mutation.record.predecessorSourceRef)));
+      if (crossAccountPredecessor) {
+        fail('INVALID_PREDECESSOR_TRANSITION', 'The explicit predecessor is on a different source account.');
+      }
+      fail('MISSING_PREDECESSOR', 'The explicit predecessor does not resolve to one current transaction.');
+    }
     const transaction = predecessorEntry.transaction;
     if (transaction.sourceLifecycle !== 'pending' || transaction.accountId !== account.id || transaction.sourceAccountRef !== mutation.sourceAccountRef) {
       fail('INVALID_PREDECESSOR_TRANSITION', 'The explicit predecessor is not a pending record on the same source account.');
@@ -514,7 +536,7 @@ function applyPendingPostedTransitions(state, domain, batch, context, accounts, 
   }
 }
 
-function hasUserWork(domain, transaction) {
+function hasMeaningfulUserInterpretation(domain, transaction) {
   return transaction.reviewStatus !== 'pending'
     || transaction.movementType !== 'unclassified'
     || domain.allocations.some(item => item.transactionId === transaction.id)
@@ -523,10 +545,15 @@ function hasUserWork(domain, transaction) {
     || domain.reimbursementPaymentLinks.some(item => item.inflowTransactionId === transaction.id);
 }
 
+function sourceAmountChangeRequiresInterpretationReview(domain, transaction, record) {
+  const amountChanged = transaction.amountCents !== record.amountCents || transaction.currency !== record.currency;
+  return amountChanged && hasMeaningfulUserInterpretation(domain, transaction);
+}
+
 function tombstoneTransaction(state, domain, transaction, batch, context, {reason, observedAt, successorTransactionId = null, conflictKind = 'source_removed'}, counts) {
   if (transaction.sourceLifecycle === 'removed' && transaction.tombstone?.reason === reason) return false;
   transaction.sourceHistory.push(historySnapshot(transaction, batch, observedAt));
-  if (hasUserWork(domain, transaction)) {
+  if (hasMeaningfulUserInterpretation(domain, transaction)) {
     const existingConflictId = transaction.interpretationConflictId;
     createInterpretationConflict(domain, transaction, batch, context, {
       kind:conflictKind,
@@ -554,7 +581,7 @@ function tombstoneTransaction(state, domain, transaction, batch, context, {reaso
 
 function applyRemovals(state, domain, batch, context, transactions, counts) {
   for (const mutation of batch.transactionMutations.filter(item => item.kind === 'remove')) {
-    const key = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceRecordRef);
+    const key = transactionSourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef);
     const entry = transactions.get(key);
     if (entry?.alias) {
       entry.alias.lifecycle = 'removed';
@@ -570,7 +597,9 @@ function applyRemovals(state, domain, batch, context, transactions, counts) {
       continue;
     }
     const tombstoneId = `source-tombstone-${batch.payloadDigest.slice(0, 12)}-${domain.sourceTombstones.length + 1}`;
-    if (domain.sourceTombstones.some(item => item.sourceKind === batch.sourceKind && item.sourceNamespace === batch.sourceNamespace && item.sourceRecordRef === mutation.sourceRecordRef)) continue;
+    if (domain.sourceTombstones.some(item => item.sourceKind === batch.sourceKind
+      && item.sourceNamespace === batch.sourceNamespace && item.sourceAccountRef === mutation.sourceAccountRef
+      && item.sourceRecordRef === mutation.sourceRecordRef)) continue;
     domain.sourceTombstones.push({
       id:tombstoneId,
       batchId:batch.batchId,
@@ -606,7 +635,8 @@ function applyAccountDisconnects(domain, batch, context, index, counts) {
 function applyQuarantines(state, domain, batch, context, transactions, counts) {
   for (const item of batch.quarantinedRecords) {
     const existing = domain.sourceQuarantines.find(value => value.sourceKind === batch.sourceKind
-      && value.sourceNamespace === batch.sourceNamespace && value.sourceRecordRef === item.sourceRecordRef && value.active);
+      && value.sourceNamespace === batch.sourceNamespace && value.sourceAccountRef === item.sourceAccountRef
+      && value.sourceRecordRef === item.sourceRecordRef && value.active);
     if (!existing) {
       const quarantine = {
         id:`source-quarantine-${batch.payloadDigest.slice(0, 12)}-${domain.sourceQuarantines.length + 1}`,
@@ -629,7 +659,12 @@ function applyQuarantines(state, domain, batch, context, transactions, counts) {
       counts.sourceRecordsQuarantined += 1;
       sourceAudit(domain, {...context, batch, entityType:'quarantine', entityId:quarantine.id, action:'quarantined', changedFields:['reason', 'sourceCurrency'], observedAt:item.observedAt});
     }
-    const entry = transactions.get(sourceKey(batch.sourceKind, batch.sourceNamespace, item.sourceRecordRef));
+    const entry = transactions.get(transactionSourceKey(
+      batch.sourceKind,
+      batch.sourceNamespace,
+      item.sourceAccountRef,
+      item.sourceRecordRef
+    ));
     if (entry && !entry.alias && entry.transaction.sourceLifecycle !== 'removed') {
       tombstoneTransaction(state, domain, entry.transaction, batch, context, {
         reason:'source_quarantined',
@@ -654,12 +689,30 @@ function resultCounts() {
   };
 }
 
+async function matchesRejectedCandidateCsvReceipt(receipt, batch) {
+  if (receipt.sourceKind !== 'csv' || receipt.adapterKind !== 'csv.generic.v1'
+    || receipt.sourceNamespace !== batch.sourceNamespace || receipt.batchId !== batch.batchId
+    || typeof receipt.createdAt !== 'string' || Number.isNaN(Date.parse(receipt.createdAt))) return false;
+  const legacyBatch = clone(batch);
+  // The CSV adapter used producedAt for every observational timestamp, while
+  // normal persistence used that same value as the receipt creation time.
+  legacyBatch.producedAt = receipt.createdAt;
+  legacyBatch.observation.startedAt = receipt.createdAt;
+  legacyBatch.observation.completedAt = receipt.createdAt;
+  for (const mutation of legacyBatch.accountMutations) mutation.observedAt = receipt.createdAt;
+  for (const mutation of legacyBatch.transactionMutations) mutation.observedAt = receipt.createdAt;
+  for (const record of legacyBatch.quarantinedRecords) record.observedAt = receipt.createdAt;
+  return await computeLegacyEnvelopeDigest(legacyBatch) === receipt.payloadDigest;
+}
+
 export async function reconcileMutationBatch(state, batch, {idFactory = defaultIdFactory, now = batch?.producedAt} = {}) {
   if (state?.schemaVersion !== STATE_SCHEMA_VERSION) fail('UNSUPPORTED_SCHEMA', `Ingestion requires vault schema ${STATE_SCHEMA_VERSION}.`);
   await validateSourceMutationBatch(batch);
   const priorReceipt = state.domain?.ingestionReceipts?.find(item => item.batchId === batch.batchId);
   if (priorReceipt) {
-    if (priorReceipt.payloadDigest !== batch.payloadDigest) fail('BATCH_ID_COLLISION', 'A batch identifier was reused for different content.');
+    const deterministicReplay = priorReceipt.payloadDigest === batch.payloadDigest
+      || await matchesRejectedCandidateCsvReceipt(priorReceipt, batch);
+    if (!deterministicReplay) fail('BATCH_ID_COLLISION', 'A batch identifier was reused for different content.');
     return {
       state:clone(state),
       changed:false,

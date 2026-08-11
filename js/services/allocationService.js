@@ -292,9 +292,6 @@ export async function saveAllocationDraft(state, transactionId, rows, persist, o
     const semanticType = bucketSemanticType(selectedParent);
     if (semanticType !== 'spending') {
       transaction.movementType = movementTypeForSemanticType(semanticType);
-      transaction.amountCents = semanticType === 'income'
-        ? Math.abs(transaction.amountCents)
-        : -Math.abs(transaction.amountCents);
       transaction.manualOverrides = {...(transaction.manualOverrides || {}), bucketSemanticType:semanticType};
     }
 

@@ -1,9 +1,11 @@
 # Money Moves V3A — Provider-Neutral Ingestion Implementation
 
 Date: 2026-08-11
-Status: IMPLEMENTED / AWAITING INDEPENDENT ACCEPTANCE
+Status: CANDIDATE 1 REJECTED; NARROW REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
 Domain schema: 10
 Trusted parent: `5d2c44925931292724bc4a2d62cfade3c969f606` (`v3-plaid-architecture-accepted`)
+Rejected candidate: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
+Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-2`
 
 ## Outcome and scope
 
@@ -19,6 +21,25 @@ exchange, hosted services, browser authorization, webhooks, cursors, network
 requests, foreign-exchange conversion, a Reports UI, or V3B/V3C/V3D/V3R/V3E
 behavior. The fixture adapter is test-only source behavior implemented without
 network access. V3A is not accepted by this implementation report.
+
+## Candidate 1 rejection and narrow remediation
+
+Independent acceptance rejected Candidate 1 after reproducing four blockers:
+
+1. CSV replay identity included `producedAt` and related observation times, so
+   identical bytes/profile imported later collided with the original receipt.
+2. Amount-change conflicts were gated by active allocations, allowing a
+   classified or reviewed transaction without allocations to keep stale user
+   meaning after an ordinary modification or pending-to-posted transition.
+3. The allocation review workflow rewrote signed canonical `amountCents` to
+   match a system classification instead of preserving the source movement.
+4. Transaction source identity omitted source-account scope, so equal external
+   transaction IDs in two CSV accounts collided.
+
+Candidate 2 changes only those invariants and directly related regression
+coverage. It does not reopen the accepted V3 architecture or add V3B, live
+Plaid, backend/network behavior, Hosted Link, cursor/webhook code, FX, or a
+Reports UI. Independent re-acceptance is still required in a separate review.
 
 ## Requirements affected
 
@@ -75,13 +96,16 @@ Local ownership and source identity are distinct:
 
 ```text
 account source key     = sourceKind + sourceNamespace + sourceAccountRef
-transaction source key = sourceKind + sourceNamespace + sourceRecordRef
+transaction source key = sourceKind + sourceNamespace + sourceAccountRef + sourceRecordRef
 local account ID       = Money Moves-owned stable ID
 local transaction ID   = Money Moves-owned stable ID
 ```
 
-Source namespaces prevent collisions across separate imports or connections.
-Same-looking transactions and accounts remain separate when source keys differ.
+Source namespaces prevent collisions across separate imports or connections;
+source-account scope permits two accounts to carry the same legitimate external
+transaction reference without merging them. The same account/reference pair is
+stable on reimport. Same-looking transactions and accounts remain separate when
+source keys differ.
 Semantic similarity—date, amount, merchant, description, or category—is never
 used as an identity or automatic pending match. Pending aliases remain indexed
 to the same local transaction after a valid posted replacement.
@@ -96,9 +120,21 @@ money evidence, duplicate terminal source references, lineage cycles,
 cross-account predecessors, oversized counts/strings/payloads, and digest
 mismatches fail before reconciliation.
 
-The digest covers the complete canonical payload except the digest field. A
-replayed `batchId` with the same digest returns its original receipt without a
-write; the same `batchId` with different content fails closed.
+The digest covers semantic source/content identity: contract version, stable
+batch/source/adapter identity, checkpoint, ordered account and transaction
+mutations, quarantine facts, and warnings. It intentionally excludes
+`producedAt`, the observation envelope, and per-item `observedAt` fields. Those
+timestamps remain validated and available for diagnostics and audit, but they
+cannot turn identical source content into a conflicting receipt. A replayed
+`batchId` with the same semantic digest returns its original receipt without a
+write; changed account, amount, source reference, checkpoint, or ordering fails
+closed.
+
+Rejected Candidate 1 receipts used the former complete-envelope digest. Schema
+10 retains a narrow compatibility check for those CSV receipts: only an exact
+reconstruction of the Candidate 1 canonical envelope at the receipt's original
+creation time is accepted as replay. Any changed semantic content still fails
+as `BATCH_ID_COLLISION`.
 
 ## Exact money and currency policy
 
@@ -141,12 +177,16 @@ New source keys create one local record. Exact replays are no-ops. Modifications
 append the prior source facts to `sourceHistory`, update source-owned fields,
 and append a compact source audit event. User-owned fields remain unchanged.
 
-An amount, sign, or currency correction compatible with the active allocation
-total preserves allocation IDs. An incompatible correction snapshots the prior
-review state, movement type, active allocations, claim IDs, notes, and manual
-overrides in one unresolved interpretation conflict; the old allocations are
-marked superseded and excluded from reporting until the user resolves the
-transaction. Source evidence is retained rather than silently discarded.
+One shared predicate determines whether an amount/currency change conflicts
+with meaningful user interpretation. Classification, any non-pending review
+state, allocations, notes, manual overrides, and reimbursement-payment use all
+count as authored interpretation. If none exists, an otherwise valid source
+amount change stays clean. If it exists, both ordinary modifications and
+pending-to-posted transitions snapshot prior review state, movement type,
+active allocations, claim IDs, notes, and manual overrides in one unresolved
+interpretation conflict. Active allocations are marked superseded and excluded
+from reporting until resolution. Description/date/category-only source changes
+do not create a false amount conflict.
 
 ### Pending to posted
 
@@ -180,10 +220,11 @@ not rewrite the vault.
 
 The manual adapter requires explicit source references, account references,
 currency, direction, and decimal amount. The generic CSV adapter derives a file
-digest, stable row identity, account-profile namespace, and explicit sign
-profile. It supports signed amount columns or mutually exclusive debit/credit
-columns. A supplied external transaction ID is used as source evidence;
-otherwise the file digest and row ordinal form the source reference.
+digest, stable row identity, import-profile namespace, stable source-account
+reference, and explicit sign profile. It supports signed amount columns or
+mutually exclusive debit/credit columns. A supplied external transaction ID is
+used with account scope; otherwise the accepted file-digest/row-ordinal fallback
+also participates in the account-scoped canonical source key.
 
 The existing CSV button now submits the canonical batch through StateService.
 Its legacy review-card projection remains a compatibility view, not an
@@ -222,20 +263,40 @@ snapshot, report calculation, or Reports UI.
 - `package.json` — syntax-check coverage for the new production modules.
 - This report, `IMPLEMENTATION_STATUS.md`, and `ENGINEERING_HANDOFF.md`.
 
+Candidate 2 specifically changes `ingestionContract.js`, `models.js`, the
+schema-9→10 identity initialization in `migrations.js`, `ingestionService.js`,
+`allocationService.js`, the two focused test files, and these three engineering
+documents. There are no dependency or migration-file additions.
+
 ## Tests and fixtures
 
-The 32 V3A tests use only synthetic manual, CSV, and fixture-provider values.
+The 40 V3A tests use only synthetic manual, CSV, and fixture-provider values.
 They cover exact cents and sign matrices; malformed, huge, zero, missing,
 invalid, and foreign-currency values; closed contract limits; account and
 transaction identity collisions; account ownership; source/user metadata
 attacks; add/modify/replay; allocation and reimbursement conflicts; explicit
 pending lineage; no fuzzy matching; tombstones and revival; atomic validation
 and persistence failure/retry; empty and populated schema-9 migration;
-encrypted backup/restore; quarter boundaries; batch-digest collisions; and
-static absence of network/provider-product runtime capability.
+encrypted backup/restore; quarter boundaries; semantic batch-digest collisions;
+account-scoped CSV identity; Candidate 1 receipt compatibility;
+classified/reviewed no-allocation amount conflicts; signed-source-cents
+immutability; combined two-account replay, classification, modification,
+conflict, and replay; and static absence of network/provider-product runtime
+capability.
 
-Full candidate validation records 261 unit tests and 38 Electron-focused tests,
+Full remediation validation records 271 unit tests and 38 Electron-focused tests,
 all passing with zero failures, skips, or todos. No dependency was added.
+
+## Schema decision
+
+The schema remains 10. The remediation changes no persisted entity shape and
+uses `sourceAccountRef`, which schema 10 already stores on every canonical
+transaction, as the missing identity component. The unaccepted schema-9→10
+migration is corrected in place so account-distinct equal external IDs remain
+external IDs instead of being replaced by local fallback references. Existing
+Candidate 1 CSV receipts receive the exact fail-closed compatibility treatment
+described above. A schema 11 migration would add no necessary field and would
+not improve safety.
 
 ## Security and scope review
 
@@ -247,7 +308,7 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Known limitations
 
-- V3A is an implementation candidate awaiting independent acceptance.
+- Candidate 1 was rejected; Candidate 2 awaits independent re-acceptance.
 - USD is the only active accounting currency; unsupported source values are
   quarantined without conversion.
 - The current product exposes canonical CSV ingestion through the existing CSV
@@ -260,8 +321,9 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Recommended next task
 
-Run an independent V3A acceptance review from the candidate tag. Re-read the
+Run an independent V3A re-acceptance review from
+`v3a-provider-neutral-ingestion-candidate-2`. Re-read the
 five authoritative V3 documents, audit schema-9 migration and field ownership,
-repeat the 261-unit/38-Electron validation gate, add adversarial cases if any
+repeat the 271-unit/38-Electron validation gate, add adversarial cases if any
 gap is found, and issue a separate acceptance or rejection record. Do not begin
 V3B from this implementation report alone.

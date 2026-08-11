@@ -65,8 +65,28 @@ export async function sha256Text(value) {
   return hex(new Uint8Array(digest));
 }
 
+function canonicalBatchIdentityPayload(batch) {
+  // Replay identity covers source/content facts. Production and observation
+  // timestamps stay on the validated batch for diagnostics, but cannot turn an
+  // otherwise identical import into a conflicting idempotency receipt.
+  const semantic = structuredClone(batch);
+  delete semantic.payloadDigest;
+  delete semantic.producedAt;
+  delete semantic.observation;
+  for (const mutation of semantic.accountMutations || []) delete mutation.observedAt;
+  for (const mutation of semantic.transactionMutations || []) delete mutation.observedAt;
+  for (const record of semantic.quarantinedRecords || []) delete record.observedAt;
+  return semantic;
+}
+
 export async function computeBatchDigest(batch) {
-  const unsigned = {...batch};
+  return sha256Text(stableCanonicalJson(canonicalBatchIdentityPayload(batch)));
+}
+
+export async function computeLegacyEnvelopeDigest(batch) {
+  // Rejected Candidate 1 signed the complete envelope, including observation
+  // time. Keep this only for fail-closed recognition of its persisted receipts.
+  const unsigned = structuredClone(batch);
   delete unsigned.payloadDigest;
   return sha256Text(stableCanonicalJson(unsigned));
 }
@@ -335,33 +355,45 @@ function validateDuplicateAndLineageRules(batch, errors) {
     if (accounts.has(mutation.sourceAccountRef)) errors.push(`duplicate account mutation for ${mutation.sourceAccountRef}`);
     accounts.add(mutation.sourceAccountRef);
   }
+  const transactionKey = (accountRef, recordRef) => `${accountRef}\u001f${recordRef}`;
   const transactions = new Map();
+  const transactionsByRef = new Map();
   const successorByPredecessor = new Map();
   for (const mutation of batch.transactionMutations || []) {
-    if (transactions.has(mutation.sourceRecordRef)) errors.push(`duplicate transaction mutation for ${mutation.sourceRecordRef}`);
-    transactions.set(mutation.sourceRecordRef, mutation);
+    const mutationKey = transactionKey(mutation.sourceAccountRef, mutation.sourceRecordRef);
+    if (transactions.has(mutationKey)) errors.push(`duplicate transaction mutation for ${mutation.sourceRecordRef} on ${mutation.sourceAccountRef}`);
+    transactions.set(mutationKey, mutation);
+    const sameRef = transactionsByRef.get(mutation.sourceRecordRef) || [];
+    sameRef.push(mutation);
+    transactionsByRef.set(mutation.sourceRecordRef, sameRef);
     const predecessor = mutation.record?.predecessorSourceRef;
     if (!predecessor) continue;
     if (predecessor === mutation.sourceRecordRef) errors.push(`transaction ${mutation.sourceRecordRef} cannot be its own predecessor`);
-    if (successorByPredecessor.has(predecessor)) errors.push(`predecessor ${predecessor} has multiple successors`);
-    successorByPredecessor.set(predecessor, mutation);
+    const predecessorKey = transactionKey(mutation.sourceAccountRef, predecessor);
+    if (successorByPredecessor.has(predecessorKey)) errors.push(`predecessor ${predecessor} has multiple successors on ${mutation.sourceAccountRef}`);
+    successorByPredecessor.set(predecessorKey, mutation);
   }
-  for (const [predecessorRef, successor] of successorByPredecessor) {
-    const predecessor = transactions.get(predecessorRef);
-    if (predecessor && predecessor.sourceAccountRef !== successor.sourceAccountRef) errors.push(`predecessor ${predecessorRef} crosses source accounts`);
-    const seen = new Set([successor.sourceRecordRef]);
-    let cursor = predecessorRef;
+  for (const [predecessorKey, successor] of successorByPredecessor) {
+    const predecessorRef = successor.record.predecessorSourceRef;
+    const predecessor = transactions.get(predecessorKey);
+    if (!predecessor && (transactionsByRef.get(predecessorRef) || []).some(item => item.sourceAccountRef !== successor.sourceAccountRef)) {
+      errors.push(`predecessor ${predecessorRef} crosses source accounts`);
+    }
+    const seen = new Set([transactionKey(successor.sourceAccountRef, successor.sourceRecordRef)]);
+    let cursor = predecessorKey;
     while (cursor) {
       if (seen.has(cursor)) { errors.push(`predecessor cycle includes ${cursor}`); break; }
       seen.add(cursor);
-      cursor = transactions.get(cursor)?.record?.predecessorSourceRef || null;
+      const nextRef = transactions.get(cursor)?.record?.predecessorSourceRef || null;
+      cursor = nextRef ? transactionKey(successor.sourceAccountRef, nextRef) : null;
     }
   }
   const quarantined = new Set();
   for (const item of batch.quarantinedRecords || []) {
-    if (quarantined.has(item.sourceRecordRef)) errors.push(`duplicate quarantine for ${item.sourceRecordRef}`);
-    quarantined.add(item.sourceRecordRef);
-    if (transactions.has(item.sourceRecordRef)) errors.push(`source record ${item.sourceRecordRef} cannot be active and quarantined in one batch`);
+    const quarantineKey = transactionKey(item.sourceAccountRef, item.sourceRecordRef);
+    if (quarantined.has(quarantineKey)) errors.push(`duplicate quarantine for ${item.sourceRecordRef} on ${item.sourceAccountRef}`);
+    quarantined.add(quarantineKey);
+    if (transactions.has(quarantineKey)) errors.push(`source record ${item.sourceRecordRef} cannot be active and quarantined in one batch`);
   }
 }
 

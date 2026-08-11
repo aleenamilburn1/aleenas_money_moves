@@ -4,12 +4,15 @@ import test, {beforeEach} from 'node:test';
 import {createCsvMutationBatch} from '../js/adapters/csvIngestionAdapter.js';
 import {createFixtureMutationBatch} from '../js/adapters/fixtureIngestionAdapter.js';
 import {createManualMutationBatch} from '../js/adapters/manualIngestionAdapter.js';
-import {STATE_SCHEMA_VERSION} from '../js/domain/constants.js';
+import {STATE_SCHEMA_VERSION, SYSTEM_BUCKET_IDS} from '../js/domain/constants.js';
 import {ExactMoneyError, parseExactUsdAmount} from '../js/domain/exactMoney.js';
-import {computeBatchDigest, finalizeMutationBatch, validateSourceMutationBatch} from '../js/domain/ingestionContract.js';
+import {
+  computeBatchDigest, computeLegacyEnvelopeDigest, finalizeMutationBatch, validateSourceMutationBatch
+} from '../js/domain/ingestionContract.js';
 import {migrateState, validateFoundationDomain} from '../js/domain/migrations.js';
 import {validateDomainStore} from '../js/domain/models.js';
 import {queryBucketDetail} from '../js/services/bucketService.js';
+import {saveAllocationDraft} from '../js/services/allocationService.js';
 import {applyMutationBatchAtomically, reconcileMutationBatch} from '../js/services/ingestionService.js';
 import {createStateService} from '../js/services/stateService.js';
 import {createVaultRepository} from '../js/services/vaultRepository.js';
@@ -320,6 +323,56 @@ test('amount modification without allocations updates source facts without manuf
   assert.equal(result.state.domain.allocations.length, 0);
 });
 
+test('classified or reviewed amount modifications without allocations require interpretation resolution', async () => {
+  for (const authoredState of [
+    {movementType:'expense', reviewStatus:'pending'},
+    {movementType:'unclassified', reviewStatus:'reviewed'},
+    {movementType:'expense', reviewStatus:'reviewed'}
+  ]) {
+    const state = await seededFixtureState({batchId:`authored-base-${authoredState.movementType}-${authoredState.reviewStatus}`});
+    const transaction = onlyFixtureTransaction(state);
+    Object.assign(transaction, authoredState);
+    const modified = await fixtureBatch({
+      batchId:`authored-modify-${authoredState.movementType}-${authoredState.reviewStatus}`,
+      accountMutations:[],
+      transactionMutations:[fixtureTransactionMutation(transaction.sourceRecordRef, {
+        kind:'modify', amountCents:-1500, decimal:'-15.00', sourceRevision:'revision-2'
+      })]
+    });
+    const result = await reconcileMutationBatch(state, modified, {idFactory:ids(), now:'2026-08-11T17:00:00.000Z'});
+    const updated = onlyFixtureTransaction(result.state);
+    assert.equal(updated.amountCents, -1500);
+    assert.equal(updated.reviewStatus, 'needs_resolution');
+    assert.equal(updated.movementType, authoredState.movementType);
+    assert.equal(result.state.domain.interpretationConflicts.length, 1);
+    assert.equal(result.state.domain.interpretationConflicts[0].previousReviewStatus, authoredState.reviewStatus);
+    assert.equal(result.state.domain.interpretationConflicts[0].previousMovementType, authoredState.movementType);
+  }
+});
+
+test('notes and manual overrides make an amount modification require interpretation resolution', async () => {
+  for (const authoredState of [
+    {userNote:'Keep this note'},
+    {manualOverrides:{merchantName:'Chosen name'}}
+  ]) {
+    const state = await seededFixtureState({batchId:`authored-extra-base-${Object.keys(authoredState)[0]}`});
+    const transaction = onlyFixtureTransaction(state);
+    Object.assign(transaction, authoredState);
+    const modified = await fixtureBatch({
+      batchId:`authored-extra-modify-${Object.keys(authoredState)[0]}`,
+      accountMutations:[],
+      transactionMutations:[fixtureTransactionMutation(transaction.sourceRecordRef, {
+        kind:'modify', amountCents:-1500, decimal:'-15.00', sourceRevision:'revision-2'
+      })]
+    });
+    const result = await reconcileMutationBatch(state, modified, {idFactory:ids(), now:'2026-08-11T17:00:00.000Z'});
+    const conflict = result.state.domain.interpretationConflicts[0];
+    assert.equal(onlyFixtureTransaction(result.state).reviewStatus, 'needs_resolution');
+    assert.deepEqual(conflict.manualOverridesSnapshot, authoredState.manualOverrides || null);
+    assert.equal(conflict.userNoteSnapshot, authoredState.userNote || null);
+  }
+});
+
 test('amount modification with allocations snapshots user work, supersedes active reporting, and marks explicit resolution', async () => {
   const state = await seededFixtureState();
   const transaction = onlyFixtureTransaction(state);
@@ -426,6 +479,62 @@ test('explicit pending-to-posted lineage retains local identity and allocation I
   assert.equal(onlyFixtureTransaction(transactionReplay.state).id, pending.id);
   assert.equal(transactionReplay.state.domain.transactions.filter(item => item.sourceKind === 'provider').length, 1);
   assert.equal(transactionReplay.result.counts.pendingPostedTransitions, 0);
+});
+
+test('pending-to-posted amount changes require review only when meaningful interpretation exists', async () => {
+  const cases = [
+    {name:'clean', movementType:'unclassified', reviewStatus:'pending', expectConflict:false},
+    {name:'classified', movementType:'expense', reviewStatus:'pending', expectConflict:true},
+    {name:'reviewed', movementType:'unclassified', reviewStatus:'reviewed', expectConflict:true},
+    {name:'classified-reviewed', movementType:'expense', reviewStatus:'reviewed', expectConflict:true}
+  ];
+  for (const item of cases) {
+    const pendingBatch = await fixtureBatch({
+      batchId:`pending-policy-${item.name}`,
+      transactionMutations:[fixtureTransactionMutation(`pending-${item.name}`, {
+        lifecycle:'pending', postedDate:null, amountCents:-1000, decimal:'-10.00'
+      })]
+    });
+    const pendingResult = await reconcileMutationBatch(freshState(), pendingBatch, {idFactory:ids(), now:V3A_NOW});
+    const transaction = onlyFixtureTransaction(pendingResult.state);
+    transaction.movementType = item.movementType;
+    transaction.reviewStatus = item.reviewStatus;
+    const postedBatch = await fixtureBatch({
+      batchId:`posted-policy-${item.name}`,
+      accountMutations:[],
+      transactionMutations:[fixtureTransactionMutation(`posted-${item.name}`, {
+        predecessorSourceRef:`pending-${item.name}`, amountCents:-1200, decimal:'-12.00', sourceRevision:'revision-2'
+      })]
+    });
+    const posted = await reconcileMutationBatch(pendingResult.state, postedBatch, {idFactory:ids(), now:'2026-08-11T17:00:00.000Z'});
+    const updated = onlyFixtureTransaction(posted.state);
+    assert.equal(Boolean(updated.interpretationConflictId), item.expectConflict, item.name);
+    assert.equal(updated.reviewStatus, item.expectConflict ? 'needs_resolution' : item.reviewStatus, item.name);
+    assert.equal(updated.movementType, item.movementType, item.name);
+  }
+
+  const unchangedPending = await fixtureBatch({
+    batchId:'pending-policy-unchanged',
+    transactionMutations:[fixtureTransactionMutation('pending-unchanged', {
+      lifecycle:'pending', postedDate:null, amountCents:-1000, decimal:'-10.00'
+    })]
+  });
+  const unchangedState = await reconcileMutationBatch(freshState(), unchangedPending, {idFactory:ids(), now:V3A_NOW});
+  onlyFixtureTransaction(unchangedState.state).movementType = 'expense';
+  onlyFixtureTransaction(unchangedState.state).reviewStatus = 'reviewed';
+  const unchangedPosted = await fixtureBatch({
+    batchId:'posted-policy-unchanged',
+    accountMutations:[],
+    transactionMutations:[fixtureTransactionMutation('posted-unchanged', {
+      predecessorSourceRef:'pending-unchanged', amountCents:-1000, decimal:'-10.00',
+      rawDescription:'Posted description only', sourceRevision:'revision-2'
+    })]
+  });
+  const unchanged = await reconcileMutationBatch(unchangedState.state, unchangedPosted, {idFactory:ids(), now:'2026-08-11T17:00:00.000Z'});
+  assert.equal(onlyFixtureTransaction(unchanged.state).interpretationConflictId, null);
+  assert.equal(onlyFixtureTransaction(unchanged.state).reviewStatus, 'reviewed');
+  const replay = await reconcileMutationBatch(unchanged.state, unchangedPosted, {idFactory:ids(), now:'2026-08-11T18:00:00.000Z'});
+  assert.equal(replay.result.status, 'already_applied');
 });
 
 test('pending reconciliation never fuzzy-matches and rejects missing, wrong-account, and colliding predecessors', async () => {
@@ -556,6 +665,173 @@ test('CSV adapter uses exact source identities and explicit sign profiles withou
   assert.equal((await reconcileMutationBatch(result.state, batch, {idFactory:ids()})).result.status, 'already_applied');
 });
 
+test('identical CSV content and profile replay across production times without a batch collision', async () => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-a,USD'
+  ].join('\n');
+  const profile = {id:'replay-profile', signProfile:'positive_outflow'};
+  const firstBatch = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  const laterBatch = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-12T16:00:00.000Z', profile});
+  assert.equal(firstBatch.batchId, laterBatch.batchId);
+  assert.equal(firstBatch.payloadDigest, laterBatch.payloadDigest);
+  assert.notEqual(firstBatch.producedAt, laterBatch.producedAt);
+  const first = await reconcileMutationBatch(freshState(), firstBatch, {idFactory:ids(), now:V3A_NOW});
+  const replay = await reconcileMutationBatch(first.state, laterBatch, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'});
+  assert.equal(replay.changed, false);
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 1);
+});
+
+test('schema-10 CSV receipts from rejected Candidate 1 replay safely and still reject changed content', async () => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-legacy-receipt,USD'
+  ].join('\n');
+  const profile = {id:'legacy-receipt-profile', signProfile:'positive_outflow'};
+  const original = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  const applied = await reconcileMutationBatch(freshState(), original, {idFactory:ids(), now:V3A_NOW});
+  const receipt = applied.state.domain.ingestionReceipts[0];
+  const legacyDigest = await computeLegacyEnvelopeDigest(original);
+  receipt.id = `ingestion-receipt-${legacyDigest.slice(0, 20)}`;
+  receipt.payloadDigest = legacyDigest;
+  receipt.result.payloadDigest = legacyDigest;
+  receipt.result.receipt.payloadDigest = legacyDigest;
+
+  const later = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-12T16:00:00.000Z', profile});
+  const replay = await reconcileMutationBatch(applied.state, later, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'});
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.changed, false);
+
+  const changed = structuredClone(later);
+  changed.transactionMutations[0].record.amountCents = -600;
+  changed.transactionMutations[0].record.sourceAmount.decimal = '6.00';
+  changed.payloadDigest = await computeBatchDigest(changed);
+  await assert.rejects(
+    () => reconcileMutationBatch(applied.state, changed, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+    error => error.code === 'BATCH_ID_COLLISION'
+  );
+});
+
+test('CSV retry after persistence failure remains deterministic across production times', async () => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,checking-1,tx-retry,USD'
+  ].join('\n');
+  const profile = {id:'retry-profile', signProfile:'positive_outflow'};
+  const state = freshState();
+  const before = structuredClone(state);
+  const firstBatch = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  await assert.rejects(
+    () => applyMutationBatchAtomically(state, firstBatch, async () => { throw new Error('simulated persistence failure'); }, {idFactory:ids(), now:V3A_NOW}),
+    /simulated persistence failure/
+  );
+  assert.deepEqual(state, before);
+  const retryBatch = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-12T16:00:00.000Z', profile});
+  const retry = await applyMutationBatchAtomically(state, retryBatch, async () => ({ok:true}), {
+    idFactory:ids(), now:'2026-08-12T16:00:00.000Z'
+  });
+  const replay = await applyMutationBatchAtomically(retry.state, firstBatch, async () => {
+    assert.fail('receipt replay must not persist');
+  }, {idFactory:ids(), now:'2026-08-13T16:00:00.000Z'});
+  assert.equal(retry.result.payloadDigest, firstBatch.payloadDigest);
+  assert.deepEqual(replay.result.receipt, retry.result.receipt);
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.persistence, null);
+});
+
+test('CSV transaction identity scopes the same external reference to its source account', async () => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Account A purchase,5.25,account-a,shared-123,USD',
+    '2026-08-02,Account B purchase,7.50,account-b,shared-123,USD'
+  ].join('\n');
+  const batch = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:V3A_NOW,
+    profile:{id:'multi-account-profile', signProfile:'positive_outflow'}
+  });
+  await validateSourceMutationBatch(batch);
+  assert.equal(batch.transactionMutations[0].sourceRecordRef, batch.transactionMutations[1].sourceRecordRef);
+  assert.notEqual(batch.transactionMutations[0].sourceAccountRef, batch.transactionMutations[1].sourceAccountRef);
+  const result = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(result.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 2);
+  assert.deepEqual(
+    result.state.domain.transactions.filter(item => item.sourceKind === 'csv').map(item => item.sourceAccountRef).sort(),
+    ['external:account-a', 'external:account-b']
+  );
+  const otherProfileBatch = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:V3A_NOW,
+    profile:{id:'intentionally-distinct-profile', signProfile:'positive_outflow'}
+  });
+  assert.notEqual(batch.sourceNamespace, otherProfileBatch.sourceNamespace);
+  const otherProfile = await reconcileMutationBatch(result.state, otherProfileBatch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(otherProfile.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 4);
+});
+
+test('account-scoped CSV replay and authored amount conflict preserve identity, sign, and isolation', async () => {
+  const csv = [
+    'date,description,amount,account_id,transaction_id,currency',
+    '2026-08-01,Account A movement,+12.50,account-a,shared-cross,USD',
+    '2026-08-02,Account B movement,+7.50,account-b,shared-cross,USD'
+  ].join('\n');
+  const profile = {id:'cross-invariant-profile', signProfile:'signed_cash_flow'};
+  const imported = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  const first = await reconcileMutationBatch(freshState(), imported, {idFactory:ids(), now:V3A_NOW});
+  const laterImport = await createCsvMutationBatch({csvText:csv, producedAt:'2026-08-12T16:00:00.000Z', profile});
+  const importReplay = await reconcileMutationBatch(first.state, laterImport, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'});
+  assert.equal(importReplay.result.status, 'already_applied');
+
+  const accountA = importReplay.state.domain.transactions.find(item => item.sourceAccountRef === 'external:account-a');
+  const accountB = importReplay.state.domain.transactions.find(item => item.sourceAccountRef === 'external:account-b');
+  await saveAllocationDraft(importReplay.state, accountA.id, [{
+    id:'cross-transfer-allocation', bucketId:SYSTEM_BUCKET_IDS.transfer, subBucketId:null,
+    amountCents:1250, ownershipType:'mine', note:'Preserve interpretation', createdAt:null
+  }], async () => {}, {now:'2026-08-12T17:00:00.000Z', markReviewed:true});
+  assert.equal(accountA.amountCents, 1250);
+  assert.equal(accountA.movementType, 'internal_transfer');
+  assert.equal(parseExactUsdAmount(accountA.sourceAmount.decimal, {
+    signConvention:accountA.sourceAmount.signConvention
+  }).amountCents, accountA.amountCents);
+
+  const sourceMutation = structuredClone(imported.transactionMutations.find(item => item.sourceAccountRef === 'external:account-a'));
+  sourceMutation.kind = 'modify';
+  sourceMutation.observedAt = '2026-08-13T16:00:00.000Z';
+  sourceMutation.record.amountCents = 1500;
+  sourceMutation.record.sourceAmount.decimal = '+15.00';
+  sourceMutation.record.sourceRevision = 'csv-revision-2';
+  const modification = await finalizeMutationBatch({
+    contractVersion:1,
+    batchId:'cross-invariant-modification',
+    sourceKind:'csv',
+    adapterKind:'csv.generic.v1',
+    sourceNamespace:imported.sourceNamespace,
+    producedAt:'2026-08-13T16:00:00.000Z',
+    observation:{startedAt:'2026-08-13T16:00:00.000Z', completedAt:'2026-08-13T16:00:00.000Z', environment:'local', requestRef:null},
+    checkpoint:null,
+    accountMutations:[],
+    transactionMutations:[sourceMutation],
+    quarantinedRecords:[],
+    sourceWarnings:[],
+    payloadDigest:''
+  });
+  const changed = await reconcileMutationBatch(importReplay.state, modification, {idFactory:ids(), now:'2026-08-13T16:00:00.000Z'});
+  const changedA = changed.state.domain.transactions.find(item => item.id === accountA.id);
+  const unchangedB = changed.state.domain.transactions.find(item => item.id === accountB.id);
+  assert.equal(changedA.amountCents, 1500);
+  assert.equal(changedA.movementType, 'internal_transfer');
+  assert.equal(changedA.reviewStatus, 'needs_resolution');
+  assert.equal(changedA.interpretationConflictId !== null, true);
+  assert.equal(changed.state.domain.allocations.find(item => item.id === 'cross-transfer-allocation').status, 'superseded');
+  assert.equal(unchangedB.amountCents, 750);
+  assert.equal(unchangedB.interpretationConflictId, null);
+  assert.equal(changed.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 2);
+  const mutationReplay = await reconcileMutationBatch(changed.state, modification, {idFactory:ids(), now:'2026-08-14T16:00:00.000Z'});
+  assert.equal(mutationReplay.result.status, 'already_applied');
+  assert.equal(mutationReplay.state.domain.interpretationConflicts.length, 1);
+});
+
 test('CSV debit/credit columns map exactly and require one explicit non-empty side', async () => {
   const csv = [
     'date,description,debit,credit,account,transaction_id,currency',
@@ -631,6 +907,22 @@ test('schema 9 to 10 migration is deterministic for empty/populated vaults and p
     manualOverrides:{merchantName:'User label'}, createdAt:V3A_NOW, updatedAt:V3A_NOW
   };
   schema9.domain.transactions.push(transaction);
+  const secondAccount = {
+    ...account,
+    id:'legacy-csv-account-2',
+    externalAccountId:'csv-account-id-2',
+    friendlyName:'Second account'
+  };
+  const secondTransaction = {
+    ...transaction,
+    id:'legacy-csv-transaction-2',
+    accountId:secondAccount.id,
+    rawName:'Same external ID, second account',
+    merchantName:'Same external ID, second account',
+    manualOverrides:null
+  };
+  schema9.domain.accounts.push(secondAccount);
+  schema9.domain.transactions.push(secondTransaction);
   const bucket = schema9.domain.buckets.find(item => !item.system && item.parentId === null);
   schema9.domain.allocations.push({
     id:'legacy-allocation', transactionId:transaction.id, bucketId:bucket.id, subBucketId:null, amountCents:1200,
@@ -645,6 +937,11 @@ test('schema 9 to 10 migration is deterministic for empty/populated vaults and p
   assert.equal(first.state.schemaVersion, 10);
   assert.equal(first.state.domain.accounts.find(item => item.id === account.id).friendlyName, 'Friendly stays');
   assert.equal(first.state.domain.transactions.find(item => item.id === transaction.id).sourceRecordRef, 'csv-transaction-id');
+  assert.equal(first.state.domain.transactions.find(item => item.id === secondTransaction.id).sourceRecordRef, 'csv-transaction-id');
+  assert.notEqual(
+    first.state.domain.transactions.find(item => item.id === transaction.id).sourceAccountRef,
+    first.state.domain.transactions.find(item => item.id === secondTransaction.id).sourceAccountRef
+  );
   assert.equal(first.state.domain.transactions.find(item => item.id === transaction.id).manualOverrides.merchantName, 'User label');
   assert.equal(first.state.domain.allocations.find(item => item.id === 'legacy-allocation').status, 'active');
   assert.equal(first.state.domain.buckets.filter(item => item.system).length, 3);
@@ -737,14 +1034,30 @@ test('canonical ingestion and adapters contain no provider-product-specific runt
   }
 });
 
-test('same batch ID with a different canonical payload fails closed', async () => {
+test('same batch ID with changed source reference, account, or amount fails closed', async () => {
   const firstBatch = await fixtureBatch({batchId:'colliding-batch-id'});
   const state = await reconcileMutationBatch(freshState(), firstBatch, {idFactory:ids(), now:V3A_NOW});
-  const conflicting = await fixtureBatch({
-    batchId:'colliding-batch-id',
-    transactionMutations:[fixtureTransactionMutation('different-source-ref')]
-  });
-  await assert.rejects(() => reconcileMutationBatch(state.state, conflicting, {idFactory:ids()}), error => error.code === 'BATCH_ID_COLLISION');
+  const conflicts = [
+    await fixtureBatch({
+      batchId:'colliding-batch-id',
+      transactionMutations:[fixtureTransactionMutation('different-source-ref')]
+    }),
+    await fixtureBatch({
+      batchId:'colliding-batch-id',
+      accountMutations:[fixtureAccountMutation('different-account')],
+      transactionMutations:[fixtureTransactionMutation('fixture-transaction-1', {sourceAccountRef:'different-account'})]
+    }),
+    await fixtureBatch({
+      batchId:'colliding-batch-id',
+      transactionMutations:[fixtureTransactionMutation('fixture-transaction-1', {amountCents:-1300, decimal:'-13.00'})]
+    })
+  ];
+  for (const conflicting of conflicts) {
+    await assert.rejects(
+      () => reconcileMutationBatch(state.state, conflicting, {idFactory:ids()}),
+      error => error.code === 'BATCH_ID_COLLISION'
+    );
+  }
 });
 
 test('fixture batch finalization is deterministic and payload digest covers checkpoint and ordering', async () => {

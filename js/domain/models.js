@@ -682,7 +682,7 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
   for (const transaction of domain.transactions) {
     if (!transaction.sourceKind) continue;
     for (const reference of [transaction.sourceRecordRef, ...(transaction.sourceRefAliases || []).map(alias => alias.sourceRecordRef)]) {
-      const key = `${transaction.sourceKind}|${transaction.sourceNamespace}|${reference}`;
+      const key = `${transaction.sourceKind}|${transaction.sourceNamespace}|${transaction.sourceAccountRef}|${reference}`;
       if (transactionSourceKeys.has(key) && transactionSourceKeys.get(key) !== transaction.id) {
         errors.push(`transaction ${transaction.id} duplicates source identity used by ${transactionSourceKeys.get(key)}`);
       } else transactionSourceKeys.set(key, transaction.id);

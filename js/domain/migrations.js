@@ -447,18 +447,19 @@ function initializeProviderNeutralIngestion(state, {now}) {
   for (const transaction of domain.transactions) {
     const sourceKind = providerNeutralSourceKind(transaction.source);
     const namespace = providerNeutralNamespace(transaction.source);
+    const account = accountById.get(transaction.accountId);
     const preferred = existingReference(transaction.sourceTransactionId);
     if (!preferred) continue;
-    const key = `${sourceKind}|${namespace}|${preferred}`;
+    const key = `${sourceKind}|${namespace}|${account?.sourceAccountRef || 'unknown-account'}|${preferred}`;
     transactionPreferredRefs.set(key, (transactionPreferredRefs.get(key) || 0) + 1);
   }
   for (const transaction of domain.transactions) {
     const sourceKind = providerNeutralSourceKind(transaction.source);
     const sourceNamespace = providerNeutralNamespace(transaction.source);
     const preferred = existingReference(transaction.sourceTransactionId);
-    const key = `${sourceKind}|${sourceNamespace}|${preferred}`;
-    const sourceRecordRef = preferred && transactionPreferredRefs.get(key) === 1 ? preferred : `transaction:${transaction.id}`;
     const account = accountById.get(transaction.accountId);
+    const key = `${sourceKind}|${sourceNamespace}|${account?.sourceAccountRef || 'unknown-account'}|${preferred}`;
+    const sourceRecordRef = preferred && transactionPreferredRefs.get(key) === 1 ? preferred : `transaction:${transaction.id}`;
     const sourceDate = sourceDateFromTransaction(transaction);
     const providerCategoryMetadata = transaction.providerCategory
       ? {primary:String(transaction.providerCategory), detailed:null, confidence:null, taxonomyVersion:null}
