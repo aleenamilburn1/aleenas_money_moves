@@ -4,11 +4,11 @@ import {
 } from './constants.js';
 import {FAITH_MONEY_DEVOTIONALS, devotionalById} from '../content/faithMoneyDevotionals.js';
 
-export const ACCOUNT_TYPES = new Set(['cash', 'credit', 'loan', 'savings', 'investment', 'unknown']);
-export const TRANSACTION_SOURCES = new Set(['manual', 'csv', 'migration']);
+export const ACCOUNT_TYPES = new Set(['cash', 'depository', 'credit', 'loan', 'savings', 'investment', 'other', 'unknown']);
+export const TRANSACTION_SOURCES = new Set(['manual', 'csv', 'migration', 'provider']);
 export const PENDING_STATUSES = new Set(['pending', 'posted', 'removed', 'unknown']);
 export const MOVEMENT_TYPES = new Set([
-  'expense', 'earned_income', 'reimbursement', 'merchant_refund', 'internal_transfer',
+  'unclassified', 'expense', 'earned_income', 'reimbursement', 'merchant_refund', 'internal_transfer',
   'gift', 'debt_payment', 'savings_contribution', 'interest', 'sale_proceeds',
   'other_inflow', 'other', 'excluded'
 ]);
@@ -20,6 +20,9 @@ export const PAYMENT_LINK_SOURCES = new Set(['user_linked', 'suggestion_confirme
 export const REIMBURSEMENT_ADJUSTMENT_TYPES = new Set(['write_off', 'write_off_reversal']);
 export const AUDIT_EVENT_SOURCES = new Set(['user', 'migration', 'reconciliation']);
 export const REIMBURSEMENT_STATUSES = new Set(['cancelled', 'open', 'partially_paid', 'settled', 'written_off']);
+export const SOURCE_KINDS = new Set(['manual', 'csv', 'provider']);
+export const SOURCE_LIFECYCLES = new Set(['pending', 'posted', 'removed', 'unknown']);
+export const ALLOCATION_STATUSES = new Set(['active', 'superseded']);
 
 const SYSTEM_BUCKET_SEMANTICS = Object.freeze({
   [SYSTEM_BUCKET_IDS.income]:'income',
@@ -151,10 +154,25 @@ export function validateAccount(value) {
   optionalString(value.mask, 'mask', errors);
   requiredEnum(value.type, 'type', ACCOUNT_TYPES, errors);
   optionalString(value.subtype, 'subtype', errors);
-  requiredCurrency(value.currency, errors);
-  requiredEnum(value.source, 'source', new Set(['manual', 'csv', 'migration', 'system']), errors);
+  optionalCurrency(value.currency, errors);
+  requiredEnum(value.source, 'source', new Set(['manual', 'csv', 'migration', 'system', 'provider']), errors);
   requiredBoolean(value.active, 'active', errors);
   optionalInteger(value.balanceCents, 'balanceCents', errors);
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceKind')) {
+    requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
+    requiredString(value.sourceNamespace, 'sourceNamespace', errors);
+    requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
+    optionalString(value.connectionId, 'connectionId', errors);
+    optionalString(value.institutionName, 'institutionName', errors);
+    optionalString(value.providerDisplayName, 'providerDisplayName', errors);
+    requiredBoolean(value.enabled, 'enabled', errors);
+    requiredBoolean(value.hidden, 'hidden', errors);
+    requiredEnum(value.sourceStatus, 'sourceStatus', new Set(['active', 'disconnected', 'closed', 'unknown']), errors);
+    requiredString(value.connectionStatus, 'connectionStatus', errors);
+    optionalObject(value.sourceMetadata, 'sourceMetadata', errors);
+    optionalObject(value.balances, 'balances', errors);
+    requiredTimestamp(value.sourceObservedAt, 'sourceObservedAt', errors);
+  }
   return validationResult('Account', value, errors);
 }
 
@@ -179,6 +197,47 @@ export function validateTransaction(value) {
   optionalString(value.locationSource, 'locationSource', errors);
   optionalString(value.providerCategory, 'providerCategory', errors);
   optionalObject(value.manualOverrides, 'manualOverrides', errors);
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceKind')) {
+    requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
+    requiredString(value.sourceNamespace, 'sourceNamespace', errors);
+    requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
+    requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
+    requiredEnum(value.sourceLifecycle, 'sourceLifecycle', SOURCE_LIFECYCLES, errors);
+    optionalObject(value.sourceAmount, 'sourceAmount', errors);
+    if (isPlainObject(value.sourceAmount)) {
+      requiredString(value.sourceAmount.decimal, 'sourceAmount.decimal', errors);
+      optionalCurrency(value.sourceAmount.currency, errors);
+      requiredEnum(value.sourceAmount.signConvention, 'sourceAmount.signConvention', new Set([
+        'money_moves_signed', 'positive_outflow', 'positive_inflow', 'debit_credit'
+      ]), errors);
+    }
+    optionalCalendarDate(value.sourceDate, 'sourceDate', errors);
+    optionalCalendarDate(value.authorizedDate, 'authorizedDate', errors);
+    optionalTimestamp(value.sourceAuthorizedAt, 'sourceAuthorizedAt', errors);
+    optionalCalendarDate(value.postedDate, 'postedDate', errors);
+    optionalTimestamp(value.sourcePostedAt, 'sourcePostedAt', errors);
+    optionalString(value.rawDescription, 'rawDescription', errors);
+    optionalString(value.displayDescription, 'displayDescription', errors);
+    optionalObject(value.providerCategoryMetadata, 'providerCategoryMetadata', errors);
+    optionalObject(value.sourceProvenance, 'sourceProvenance', errors);
+    if (!Array.isArray(value.sourceRefAliases)) errors.push('sourceRefAliases must be an array');
+    else for (const alias of value.sourceRefAliases) {
+      if (!isPlainObject(alias)) { errors.push('sourceRefAliases must contain objects'); continue; }
+      requiredString(alias.sourceRecordRef, 'sourceRefAliases.sourceRecordRef', errors);
+      requiredString(alias.lifecycle, 'sourceRefAliases.lifecycle', errors);
+      requiredTimestamp(alias.observedAt, 'sourceRefAliases.observedAt', errors);
+    }
+    optionalString(value.predecessorTransactionId, 'predecessorTransactionId', errors);
+    optionalObject(value.tombstone, 'tombstone', errors);
+    optionalString(value.interpretationConflictId, 'interpretationConflictId', errors);
+    if (!Array.isArray(value.sourceHistory)) errors.push('sourceHistory must be an array');
+    else for (const history of value.sourceHistory) {
+      if (!isPlainObject(history)) { errors.push('sourceHistory must contain objects'); continue; }
+      requiredTimestamp(history.observedAt, 'sourceHistory.observedAt', errors);
+      requiredString(history.batchId, 'sourceHistory.batchId', errors);
+      requiredString(history.sourceRecordRef, 'sourceHistory.sourceRecordRef', errors);
+    }
+  }
   return validationResult('Transaction', value, errors);
 }
 
@@ -231,6 +290,8 @@ export function validateAllocation(value) {
   optionalString(value.note, 'note', errors);
   // Readable only for schema-6 compatibility. Schema 7 relationships are standalone.
   optionalString(value.reimbursementClaimId, 'reimbursementClaimId', errors);
+  if (value.status !== undefined) requiredEnum(value.status, 'status', ALLOCATION_STATUSES, errors);
+  optionalString(value.supersededByConflictId, 'supersededByConflictId', errors);
   return validationResult('Allocation', value, errors);
 }
 
@@ -428,6 +489,82 @@ export function validateMerchantRule(value) {
   return validationResult('MerchantRule', value, errors);
 }
 
+function validateIngestionReceipt(value) {
+  const errors = [];
+  if (!validateBaseEntity(value, 'IngestionReceipt', errors)) return validationResult('IngestionReceipt', value, errors);
+  requiredString(value.batchId, 'batchId', errors);
+  requiredString(value.payloadDigest, 'payloadDigest', errors);
+  requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
+  requiredString(value.sourceNamespace, 'sourceNamespace', errors);
+  requiredString(value.adapterKind, 'adapterKind', errors);
+  optionalObject(value.result, 'result', errors);
+  return validationResult('IngestionReceipt', value, errors);
+}
+
+function validateSourceQuarantine(value) {
+  const errors = [];
+  if (!validateBaseEntity(value, 'SourceQuarantine', errors)) return validationResult('SourceQuarantine', value, errors);
+  requiredString(value.batchId, 'batchId', errors);
+  requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
+  requiredString(value.sourceNamespace, 'sourceNamespace', errors);
+  requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
+  optionalString(value.sourceAccountRef, 'sourceAccountRef', errors);
+  requiredEnum(value.reason, 'reason', new Set(['unsupported_currency', 'unsafe_amount', 'missing_account', 'invalid_source_record']), errors);
+  optionalString(value.rawAmountDecimal, 'rawAmountDecimal', errors);
+  optionalString(value.sourceCurrency, 'sourceCurrency', errors);
+  requiredString(value.safeDetailCode, 'safeDetailCode', errors);
+  requiredTimestamp(value.observedAt, 'observedAt', errors);
+  requiredBoolean(value.active, 'active', errors);
+  optionalTimestamp(value.resolvedAt, 'resolvedAt', errors);
+  return validationResult('SourceQuarantine', value, errors);
+}
+
+function validateSourceTombstone(value) {
+  const errors = [];
+  if (!validateBaseEntity(value, 'SourceTombstone', errors)) return validationResult('SourceTombstone', value, errors);
+  requiredString(value.batchId, 'batchId', errors);
+  requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
+  requiredString(value.sourceNamespace, 'sourceNamespace', errors);
+  requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
+  requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
+  requiredString(value.reason, 'reason', errors);
+  optionalString(value.predecessorOfRef, 'predecessorOfRef', errors);
+  requiredTimestamp(value.observedAt, 'observedAt', errors);
+  return validationResult('SourceTombstone', value, errors);
+}
+
+function validateInterpretationConflict(value) {
+  const errors = [];
+  if (!validateBaseEntity(value, 'InterpretationConflict', errors)) return validationResult('InterpretationConflict', value, errors);
+  requiredString(value.batchId, 'batchId', errors);
+  requiredString(value.transactionId, 'transactionId', errors);
+  requiredEnum(value.kind, 'kind', new Set(['source_amount_changed', 'source_removed', 'source_quarantined']), errors);
+  requiredEnum(value.status, 'status', new Set(['unresolved', 'resolved']), errors);
+  requiredString(value.previousReviewStatus, 'previousReviewStatus', errors);
+  requiredString(value.previousMovementType, 'previousMovementType', errors);
+  requiredInteger(value.previousAmountCents, 'previousAmountCents', errors, {nonZero:true});
+  optionalInteger(value.nextAmountCents, 'nextAmountCents', errors);
+  optionalString(value.previousCurrency, 'previousCurrency', errors);
+  optionalString(value.nextCurrency, 'nextCurrency', errors);
+  if (!Array.isArray(value.allocationSnapshot)) errors.push('allocationSnapshot must be an array');
+  if (!Array.isArray(value.relatedClaimIds)) errors.push('relatedClaimIds must be an array');
+  optionalObject(value.manualOverridesSnapshot, 'manualOverridesSnapshot', errors);
+  optionalString(value.userNoteSnapshot, 'userNoteSnapshot', errors);
+  return validationResult('InterpretationConflict', value, errors);
+}
+
+function validateSourceAuditEvent(value) {
+  const errors = [];
+  if (!validateBaseEntity(value, 'SourceAuditEvent', errors)) return validationResult('SourceAuditEvent', value, errors);
+  requiredString(value.batchId, 'batchId', errors);
+  requiredEnum(value.entityType, 'entityType', new Set(['account', 'transaction', 'quarantine', 'source_tombstone']), errors);
+  requiredString(value.entityId, 'entityId', errors);
+  requiredString(value.action, 'action', errors);
+  if (!Array.isArray(value.changedFields) || value.changedFields.some(field => typeof field !== 'string' || !field)) errors.push('changedFields must contain field names');
+  requiredTimestamp(value.observedAt, 'observedAt', errors);
+  return validationResult('SourceAuditEvent', value, errors);
+}
+
 export function assertValid(result) {
   if (!result.ok) throw new ModelValidationError(result.modelName, result.errors);
   return result.value;
@@ -451,6 +588,19 @@ export function validateBucketTree(buckets, {legacySemanticType = false} = {}) {
     else if (parent.parentId) errors.push(`bucket ${bucket.id} would create a third nesting level`);
   }
   return validationResult('BucketTree', buckets, errors);
+}
+
+export function isAllocationActive(allocation) {
+  return allocation?.status !== 'superseded';
+}
+
+export function isTransactionActiveForReporting(transaction) {
+  const lifecycle = transaction?.sourceLifecycle ?? transaction?.pendingStatus;
+  return lifecycle !== 'removed' && transaction?.pendingStatus !== 'removed';
+}
+
+export function transactionHasUnresolvedInterpretation(transaction) {
+  return typeof transaction?.interpretationConflictId === 'string' && transaction.interpretationConflictId.length > 0;
 }
 
 export function validateAllocationsForTransaction(allocations, transactionAmountCents) {
@@ -493,7 +643,7 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
   const bucketIds = new Set(domain.buckets.map(bucket => bucket.id));
   for (const transaction of domain.transactions) {
     if (!accountIds.has(transaction.accountId)) errors.push(`transaction ${transaction.id} references missing account ${transaction.accountId}`);
-    const allocations = domain.allocations.filter(allocation => allocation.transactionId === transaction.id);
+    const allocations = domain.allocations.filter(allocation => allocation.transactionId === transaction.id && isAllocationActive(allocation));
     if (allocations.length) {
       const allocationValidation = validateAllocationsForTransaction(allocations, transaction.amountCents);
       if (!allocationValidation.ok) errors.push(...allocationValidation.errors.map(error => `transaction ${transaction.id}: ${error}`));
@@ -509,6 +659,9 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
       if (!subBucket) errors.push(`allocation ${allocation.id} references missing sub-bucket ${allocation.subBucketId}`);
       else if (subBucket.parentId !== allocation.bucketId) errors.push(`allocation ${allocation.id} sub-bucket ${allocation.subBucketId} must be a child of ${allocation.bucketId}`);
     }
+    if (allocation.status === 'superseded' && !allocation.supersededByConflictId) {
+      errors.push(`allocation ${allocation.id} is superseded without an interpretation conflict`);
+    }
   }
   for (const rule of domain.merchantRules) {
     if (typeof rule.action.bucketId === 'string' && !bucketIds.has(rule.action.bucketId)) {
@@ -517,6 +670,24 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
   }
   const tree = validateBucketTree(domain.buckets, {legacySemanticType});
   if (!tree.ok) errors.push(...tree.errors);
+
+  const accountSourceKeys = new Map();
+  for (const account of domain.accounts) {
+    if (!account.sourceKind) continue;
+    const key = `${account.sourceKind}|${account.sourceNamespace}|${account.sourceAccountRef}`;
+    if (accountSourceKeys.has(key)) errors.push(`account ${account.id} duplicates source identity used by ${accountSourceKeys.get(key)}`);
+    else accountSourceKeys.set(key, account.id);
+  }
+  const transactionSourceKeys = new Map();
+  for (const transaction of domain.transactions) {
+    if (!transaction.sourceKind) continue;
+    for (const reference of [transaction.sourceRecordRef, ...(transaction.sourceRefAliases || []).map(alias => alias.sourceRecordRef)]) {
+      const key = `${transaction.sourceKind}|${transaction.sourceNamespace}|${reference}`;
+      if (transactionSourceKeys.has(key) && transactionSourceKeys.get(key) !== transaction.id) {
+        errors.push(`transaction ${transaction.id} duplicates source identity used by ${transactionSourceKeys.get(key)}`);
+      } else transactionSourceKeys.set(key, transaction.id);
+    }
+  }
 }
 
 function relationshipIdErrors(domain, errors) {
@@ -727,6 +898,15 @@ export function validateDomainStore(domain, {legacyReimbursements = false, legac
       ['auditEvents', validateAuditEvent]
     ]) validateCollection(domain, field, validator, errors);
   }
+  for (const [field, validator] of [
+    ['ingestionReceipts', validateIngestionReceipt],
+    ['sourceQuarantines', validateSourceQuarantine],
+    ['sourceTombstones', validateSourceTombstone],
+    ['interpretationConflicts', validateInterpretationConflict],
+    ['sourceAuditEvents', validateSourceAuditEvent]
+  ]) {
+    if (domain[field] !== undefined) validateCollection(domain, field, validator, errors);
+  }
   if (errors.length) return validationResult('DomainStore', domain, errors);
   if (!legacyDevotionalState || domain.devotionalState !== undefined) {
     const devotionalValidation = validateDevotionalState(domain.devotionalState);
@@ -735,6 +915,34 @@ export function validateDomainStore(domain, {legacyReimbursements = false, legac
   if (errors.length) return validationResult('DomainStore', domain, errors);
   validateBaseRelationships(domain, errors, {legacySemanticType});
   if (!legacyReimbursements) validateReimbursementRelationships(domain, errors);
+  if (Array.isArray(domain.interpretationConflicts)) {
+    const conflicts = new Map(domain.interpretationConflicts.map(item => [item.id, item]));
+    const transactions = new Map(domain.transactions.map(item => [item.id, item]));
+    for (const conflict of conflicts.values()) {
+      if (!transactions.has(conflict.transactionId)) errors.push(`interpretation conflict ${conflict.id} references missing transaction ${conflict.transactionId}`);
+      for (const allocation of conflict.allocationSnapshot || []) {
+        if (allocation.transactionId !== conflict.transactionId) errors.push(`interpretation conflict ${conflict.id} contains an unrelated allocation snapshot`);
+      }
+    }
+    for (const transaction of transactions.values()) {
+      if (transaction.interpretationConflictId && !conflicts.has(transaction.interpretationConflictId)) {
+        errors.push(`transaction ${transaction.id} references missing interpretation conflict ${transaction.interpretationConflictId}`);
+      }
+    }
+    for (const allocation of domain.allocations) {
+      if (allocation.status === 'superseded' && !conflicts.has(allocation.supersededByConflictId)) {
+        errors.push(`allocation ${allocation.id} references missing interpretation conflict ${allocation.supersededByConflictId}`);
+      }
+    }
+  }
+  if (Array.isArray(domain.ingestionReceipts)) {
+    const batches = new Map();
+    for (const receipt of domain.ingestionReceipts) {
+      const prior = batches.get(receipt.batchId);
+      if (prior && prior !== receipt.payloadDigest) errors.push(`batch ${receipt.batchId} has conflicting ingestion receipts`);
+      batches.set(receipt.batchId, receipt.payloadDigest);
+    }
+  }
   return validationResult('DomainStore', domain, errors);
 }
 

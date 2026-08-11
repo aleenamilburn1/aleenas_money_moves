@@ -1,6 +1,7 @@
 import {PRODUCT_NAME, STARTER_SPENDING_BUCKETS, STATE_SCHEMA_VERSION, SYSTEM_BUCKET_IDS, UNKNOWN_ACCOUNT_ID} from './constants.js';
 import {FAITH_MONEY_DEVOTIONALS} from '../content/faithMoneyDevotionals.js';
 import {createUnknownAccount, validateAuditEvent, validateDomainStore, validateBucket} from './models.js';
+import {formatSignedCents} from './exactMoney.js';
 import {canonicalTransactionFromLegacy, deterministicAllocationId} from '../services/allocationService.js';
 import {initializeStateRevision} from '../services/stateRevision.js';
 
@@ -12,7 +13,8 @@ const FOUNDATION_MIGRATIONS = [
   {from:5, to:6, id:'v2a-transaction-allocations', migrate:migrateTraceableLegacyAssignments},
   {from:6, to:7, id:'v2a-reimbursement-relationship-foundation', migrate:migrateReimbursementRelationships},
   {from:7, to:8, id:'v2b-desktop-beta-bucket-workflow', migrate:initializeDesktopBetaBucketWorkflow},
-  {from:8, to:9, id:'v2c-faith-money-devotional-state', migrate:initializeFaithMoneyDevotionalState}
+  {from:8, to:9, id:'v2c-faith-money-devotional-state', migrate:initializeFaithMoneyDevotionalState},
+  {from:9, to:10, id:'v3a-provider-neutral-ingestion', migrate:initializeProviderNeutralIngestion}
 ];
 
 function clone(value) {
@@ -360,6 +362,145 @@ function initializeFaithMoneyDevotionalState(state, {now}) {
       savedDevotionalIds:[],
       entries:[]
     };
+  }
+  return state;
+}
+
+function providerNeutralSourceKind(source) {
+  return source === 'csv' ? 'csv' : 'manual';
+}
+
+function providerNeutralNamespace(source) {
+  if (source === 'csv') return 'csv:legacy';
+  if (source === 'manual') return 'manual:vault';
+  return 'manual:legacy-migration';
+}
+
+function adapterKindForLegacySource(source) {
+  if (source === 'csv') return 'csv.generic.v1';
+  if (source === 'manual') return 'manual.v1';
+  return 'migration.schema9';
+}
+
+function existingReference(value) {
+  const candidate = clean(value);
+  return candidate || null;
+}
+
+function sourceDateFromTransaction(transaction) {
+  for (const value of [transaction.displayDate, transaction.postedAt, transaction.authorizedAt]) {
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return value.slice(0, 10);
+  }
+  return null;
+}
+
+function initializeProviderNeutralIngestion(state, {now}) {
+  initializeDomainStore(state, {now});
+  const domain = state.domain;
+  for (const field of [
+    'ingestionReceipts', 'sourceQuarantines', 'sourceTombstones', 'interpretationConflicts', 'sourceAuditEvents'
+  ]) domain[field] = Array.isArray(domain[field]) ? domain[field] : [];
+
+  const accountPreferredRefs = new Map();
+  for (const account of domain.accounts) {
+    const source = account.source || 'migration';
+    const namespace = providerNeutralNamespace(source);
+    const preferred = existingReference(account.externalAccountId);
+    if (preferred) {
+      const key = `${providerNeutralSourceKind(source)}|${namespace}|${preferred}`;
+      accountPreferredRefs.set(key, (accountPreferredRefs.get(key) || 0) + 1);
+    }
+  }
+  for (const account of domain.accounts) {
+    const source = account.source || 'migration';
+    const sourceKind = providerNeutralSourceKind(source);
+    const sourceNamespace = account.id === UNKNOWN_ACCOUNT_ID ? 'manual:vault' : providerNeutralNamespace(source);
+    const preferred = existingReference(account.externalAccountId);
+    const countKey = `${sourceKind}|${sourceNamespace}|${preferred}`;
+    const sourceAccountRef = account.id === UNKNOWN_ACCOUNT_ID
+      ? 'unknown-account'
+      : (preferred && accountPreferredRefs.get(countKey) === 1 ? preferred : `account:${account.id}`);
+    Object.assign(account, {
+      sourceKind,
+      sourceNamespace,
+      sourceAccountRef,
+      connectionId:null,
+      institutionName:account.institutionName ?? null,
+      providerDisplayName:account.providerDisplayName ?? account.officialName ?? null,
+      enabled:account.enabled ?? account.active !== false,
+      hidden:account.hidden ?? false,
+      sourceStatus:account.sourceStatus ?? (account.active === false ? 'closed' : 'active'),
+      connectionStatus:account.connectionStatus ?? 'not_applicable',
+      sourceMetadata:isPlainObject(account.sourceMetadata) ? account.sourceMetadata : {},
+      balances:account.balances ?? (account.balanceCents === null || account.balanceCents === undefined ? null : {
+        currentCents:account.balanceCents,
+        availableCents:null,
+        limitCents:null,
+        observedAt:account.updatedAt || now
+      }),
+      sourceObservedAt:account.sourceObservedAt ?? account.updatedAt ?? now
+    });
+  }
+
+  const accountById = new Map(domain.accounts.map(account => [account.id, account]));
+  const transactionPreferredRefs = new Map();
+  for (const transaction of domain.transactions) {
+    const sourceKind = providerNeutralSourceKind(transaction.source);
+    const namespace = providerNeutralNamespace(transaction.source);
+    const preferred = existingReference(transaction.sourceTransactionId);
+    if (!preferred) continue;
+    const key = `${sourceKind}|${namespace}|${preferred}`;
+    transactionPreferredRefs.set(key, (transactionPreferredRefs.get(key) || 0) + 1);
+  }
+  for (const transaction of domain.transactions) {
+    const sourceKind = providerNeutralSourceKind(transaction.source);
+    const sourceNamespace = providerNeutralNamespace(transaction.source);
+    const preferred = existingReference(transaction.sourceTransactionId);
+    const key = `${sourceKind}|${sourceNamespace}|${preferred}`;
+    const sourceRecordRef = preferred && transactionPreferredRefs.get(key) === 1 ? preferred : `transaction:${transaction.id}`;
+    const account = accountById.get(transaction.accountId);
+    const sourceDate = sourceDateFromTransaction(transaction);
+    const providerCategoryMetadata = transaction.providerCategory
+      ? {primary:String(transaction.providerCategory), detailed:null, confidence:null, taxonomyVersion:null}
+      : null;
+    Object.assign(transaction, {
+      sourceKind,
+      sourceNamespace,
+      sourceRecordRef,
+      sourceAccountRef:account?.sourceAccountRef || 'unknown-account',
+      sourceLifecycle:transaction.pendingStatus || 'unknown',
+      sourceAmount:{
+        decimal:formatSignedCents(transaction.amountCents),
+        currency:transaction.currency ?? null,
+        signConvention:'money_moves_signed'
+      },
+      sourceDate,
+      authorizedDate:typeof transaction.authorizedAt === 'string' ? transaction.authorizedAt.slice(0, 10) : null,
+      sourceAuthorizedAt:transaction.authorizedAt ?? null,
+      postedDate:typeof transaction.postedAt === 'string' ? transaction.postedAt.slice(0, 10) : null,
+      sourcePostedAt:transaction.postedAt ?? null,
+      rawDescription:transaction.rawName ?? null,
+      displayDescription:transaction.merchantName ?? transaction.rawName ?? null,
+      providerCategoryMetadata,
+      sourceProvenance:{
+        adapterKind:adapterKindForLegacySource(transaction.source),
+        observedAt:transaction.updatedAt || now,
+        sourceRevision:null,
+        sourceUpdatedAt:null,
+        migratedFromSchema:9
+      },
+      sourceRefAliases:[],
+      predecessorTransactionId:null,
+      tombstone:transaction.pendingStatus === 'removed' ? {
+        reason:'unknown', observedAt:transaction.updatedAt || now, successorTransactionId:null, priorSourceRecordRef:sourceRecordRef
+      } : null,
+      interpretationConflictId:null,
+      sourceHistory:[]
+    });
+  }
+  for (const allocation of domain.allocations) {
+    allocation.status = allocation.status ?? 'active';
+    allocation.supersededByConflictId = allocation.supersededByConflictId ?? null;
   }
   return state;
 }

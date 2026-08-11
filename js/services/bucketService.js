@@ -1,5 +1,5 @@
 import {DEFAULT_CURRENCY, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
-import {validateBucketTree, validateDomainStore} from '../domain/models.js';
+import {isAllocationActive, isTransactionActiveForReporting, validateBucketTree, validateDomainStore} from '../domain/models.js';
 import {canonicalAllocationRows} from './allocationService.js';
 import {advanceStateRevision} from './stateRevision.js';
 
@@ -314,8 +314,8 @@ export function queryBucketDetail(state, bucketId, filters = {}) {
 }
 
 export function queryUnassignedTransactions(state, filters = {}) {
-  const d = domain(state), allocated = new Set(d.allocations.map(item => item.transactionId));
-  const canonical = d.transactions.filter(tx => !allocated.has(tx.id)).map(tx => ({
+  const d = domain(state), allocated = new Set(d.allocations.filter(isAllocationActive).map(item => item.transactionId));
+  const canonical = d.transactions.filter(tx => isTransactionActiveForReporting(tx) && !allocated.has(tx.id)).map(tx => ({
     rowId:`unassigned:${tx.id}`, transactionId:tx.id, date:transactionDate(tx), merchant:transactionLabel(tx),
     amountCents:Math.abs(tx.amountCents), accountId:tx.accountId || UNKNOWN_ACCOUNT_ID,
     accountName:d.accounts.find(account => account.id === tx.accountId)?.friendlyName || 'Unknown account',

@@ -1,5 +1,5 @@
 import {DEFAULT_CURRENCY, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
-import {validateAllocation, validateDomainStore} from '../domain/models.js';
+import {isAllocationActive, isTransactionActiveForReporting, validateAllocation, validateDomainStore} from '../domain/models.js';
 import {advanceStateRevision} from './stateRevision.js';
 
 export class AllocationOperationError extends Error {
@@ -142,7 +142,7 @@ function newId(idFactory) {
 }
 
 export function getTransactionAllocations(state, transactionId) {
-  return domain(state).allocations.filter(item => item.transactionId === transactionId)
+  return domain(state).allocations.filter(item => item.transactionId === transactionId && isAllocationActive(item))
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
     .map(clone);
 }
@@ -278,7 +278,15 @@ export async function saveAllocationDraft(state, transactionId, rows, persist, o
     }
     const transaction = ensureCanonicalTransaction(state, transactionId, now);
     const replacements = persistedAllocations(state, transactionId, rows, now);
-    d.allocations = [...d.allocations.filter(item => item.transactionId !== transactionId), ...replacements];
+    d.allocations = [...d.allocations.filter(item => item.transactionId !== transactionId || !isAllocationActive(item)), ...replacements];
+    if (transaction.interpretationConflictId) {
+      const conflict = d.interpretationConflicts?.find(item => item.id === transaction.interpretationConflictId);
+      if (conflict) {
+        conflict.status = 'resolved';
+        conflict.updatedAt = now;
+      }
+      transaction.interpretationConflictId = null;
+    }
 
     const selectedParent = d.buckets.find(item => item.id === replacements[0].bucketId);
     const semanticType = bucketSemanticType(selectedParent);
@@ -320,9 +328,9 @@ export function canonicalAllocationRows(state) {
   const transactions = new Map(d.transactions.map(item => [item.id, item]));
   const accounts = new Map(d.accounts.map(item => [item.id, item]));
   const legacyTransactions = new Map((state.review?.transactions || []).map(item => [item.id, item]));
-  return d.allocations.flatMap(allocation => {
+  return d.allocations.filter(isAllocationActive).flatMap(allocation => {
     const transaction = transactions.get(allocation.transactionId);
-    if (!transaction) return [];
+    if (!transaction || !isTransactionActiveForReporting(transaction) || transaction.interpretationConflictId) return [];
     const account = accounts.get(transaction.accountId);
     return [{
       rowId:`allocation:${allocation.id}`,

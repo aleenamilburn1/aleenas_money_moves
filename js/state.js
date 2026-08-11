@@ -276,14 +276,15 @@ export function assignBucket(state, transactionId, bucketId, rememberRule=false)
 
 export function addTransactions(state, rawTransactions, source='csv') {
   const ids = new Set(state.review.transactions.map(tx=>tx.id));
-  const prints = new Set(state.review.transactions.map(fingerprint));
   let imported=0, duplicates=0;
   for (const raw of rawTransactions) {
-    const tx = normalizeTransaction({...raw,source},state);
-    const fp = fingerprint(tx);
-    if (ids.has(tx.id) || prints.has(fp)) { duplicates+=1; continue; }
+    // Legacy compatibility only. Current CSV/manual ingestion uses the V3A
+    // source-key reconciler. Even here, semantic facts never establish identity.
+    const id = raw.id || raw.transactionId || crypto.randomUUID();
+    const tx = normalizeTransaction({...raw,id,source},state);
+    if (ids.has(tx.id)) { duplicates+=1; continue; }
     state.review.transactions.push(tx);
-    ids.add(tx.id); prints.add(fp); imported+=1;
+    ids.add(tx.id); imported+=1;
   }
   const weeks = availableWeeks(state);
   if (weeks.length) state.review.selectedWeek = weeks[0];

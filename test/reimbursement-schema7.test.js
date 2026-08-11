@@ -53,14 +53,14 @@ test('schema 6 to current initializes canonical collections and is clone-first, 
   assert.equal(first.fromVersion, 6);
   assert.equal(first.toVersion, STATE_SCHEMA_VERSION);
   assert.equal(first.state.schemaVersion, STATE_SCHEMA_VERSION);
-  assert.deepEqual(first.applied, ['v2a-reimbursement-relationship-foundation', 'v2b-desktop-beta-bucket-workflow', 'v2c-faith-money-devotional-state']);
+  assert.deepEqual(first.applied, ['v2a-reimbursement-relationship-foundation', 'v2b-desktop-beta-bucket-workflow', 'v2c-faith-money-devotional-state', 'v3a-provider-neutral-ingestion']);
   assert.deepEqual(first.state, sameInput.state);
   assert.equal(repeated.changed, false);
   assert.deepEqual(repeated.state, first.state);
   for (const field of ['reimbursementClaims', 'reimbursementClaimAllocations', 'reimbursementPaymentLinks', 'reimbursementAdjustments', 'auditEvents']) {
     assert.deepEqual(first.state.domain[field], []);
   }
-  assert.equal(first.state.migration.appliedMigrations.at(-1), 'v2c-faith-money-devotional-state');
+  assert.equal(first.state.migration.appliedMigrations.at(-1), 'v3a-provider-neutral-ingestion');
   assert.deepEqual(first.state.migration.reimbursementSchema7, {convertedClaimCount:0, unresolvedClaimCount:0});
 });
 
@@ -369,7 +369,12 @@ test('canonical migration output and unresolved identities are stable when seman
 test('one inflow can fund several claims and several inflows can fund one claim without over-application', () => {
   const domain = openDomain();
   domain.allocations.push({...structuredClone(domain.allocations[0]), id:'allocation-second', transactionId:'expense-second'});
-  domain.transactions.push({...structuredClone(domain.transactions[0]), id:'expense-second'});
+  domain.transactions.push({
+    ...structuredClone(domain.transactions[0]),
+    id:'expense-second',
+    sourceTransactionId:'expense-second',
+    sourceRecordRef:'transaction:expense-second'
+  });
   domain.reimbursementClaims.push({...structuredClone(domain.reimbursementClaims[0]), id:'claim-second'});
   domain.reimbursementClaimAllocations.push({
     ...structuredClone(domain.reimbursementClaimAllocations[0]), id:'claim-allocation-second', claimId:'claim-second', allocationId:'allocation-second'

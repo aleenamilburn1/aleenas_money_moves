@@ -1,4 +1,4 @@
-import {parseCsv, rowsToTransactions} from './csv.js';
+import {createCsvMutationBatch} from './adapters/csvIngestionAdapter.js';
 import {createStateService} from './services/stateService.js';
 import {advanceStateRevision} from './services/stateRevision.js';
 import {
@@ -11,7 +11,7 @@ import {
 } from './services/allocationService.js';
 import {
   upgradeStateWithMigration, money, monthLabel, availableMonths, availableWeeks, weekLabel,
-  weekStats, weekTransactions, reviewQueue, addTransactions,
+  weekStats, weekTransactions, reviewQueue,
   monthSummary, debtAccounts,
   rankedDestinations, addVisited, bucketById
 } from './state.js';
@@ -871,10 +871,24 @@ function escapeAttr(value) { return escapeHtml(value); }
 async function importSelectedFile(file) {
   if (!file) return;
   try {
-    const rows=parseCsv(await file.text());
-    const converted=rowsToTransactions(rows,state.review.importSettings);
-    const result=await applyCanonicalChange(()=>addTransactions(state,converted.transactions,'csv'));
-    setMessage('importMessage',`${result.imported} imported · ${result.duplicates} duplicates skipped${converted.rejected.length?` · ${converted.rejected.length} rejected`:''}`);
+    const batch=await createCsvMutationBatch({
+      csvText:await file.text(),
+      producedAt:new Date().toISOString(),
+      profile:{
+        signProfile:state.review.importSettings.positiveMeansSpend === false ? 'signed_cash_flow' : 'positive_outflow',
+        currency:'USD',
+        currencyGuaranteed:true
+      }
+    });
+    const applied=await stateService.applyIngestionBatch(state,activeKey,keyMeta,batch,{expectedVaultGeneration:vaultGeneration});
+    state=applied.state;
+    keyMeta=applied.meta;
+    vaultGeneration=applied.vaultGeneration;
+    externalVaultChangeObserved=false;
+    const counts=applied.result.counts;
+    const replay=applied.result.status==='already_applied' ? ' · already imported' : '';
+    const quarantined=counts.sourceRecordsQuarantined ? ` · ${counts.sourceRecordsQuarantined} quarantined` : '';
+    setMessage('importMessage',`${counts.transactionsAdded} imported${replay}${quarantined}`);
     renderAll();
     selectScreen('review');
   } catch (error) {

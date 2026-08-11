@@ -632,8 +632,9 @@ export function projectClaim(state, claimId, {asOf = null} = {}) {
   const d = domain(state);
   const claim = claimById(d, claimId);
   const projection = projectReimbursementClaim(d, claimId, {asOf});
+  const needsResolution = (d.interpretationConflicts || []).some(item => item.status === 'unresolved' && item.relatedClaimIds?.includes(claimId));
   return {
-    ...clone(claim), ...projection,
+    ...clone(claim), ...projection, needsResolution,
     allocationLinks:clone(d.reimbursementClaimAllocations.filter(item => item.claimId === claimId)),
     paymentLinks:clone(d.reimbursementPaymentLinks.filter(item => item.claimId === claimId)),
     adjustments:clone(d.reimbursementAdjustments.filter(item => item.claimId === claimId))
@@ -645,7 +646,7 @@ export function projectClaims(state, {asOf = null} = {}) {
 }
 
 export function projectOpenClaims(state, options = {}) {
-  return projectClaims(state, options).filter(item => item.status === 'open' || item.status === 'partially_paid');
+  return projectClaims(state, options).filter(item => !item.needsResolution && (item.status === 'open' || item.status === 'partially_paid'));
 }
 
 export function projectSettledClaims(state, options = {}) {
@@ -657,15 +658,21 @@ export function projectCancelledClaims(state, options = {}) {
 }
 
 export function projectClaimsNeedingResolution(state) {
-  return clone(state?.legacyFoundation?.unresolvedReimbursementClaims || []).map(item => ({
+  const legacy = clone(state?.legacyFoundation?.unresolvedReimbursementClaims || []).map(item => ({
     id:item.id, status:'needs_resolution', reasonCodes:clone(item.reasonCodes || []), sourceSchemaVersion:item.sourceSchemaVersion,
     migratedAt:item.migratedAt, originalClaimId:clean(item.originalClaim?.id) || null
   }));
+  const ingestion = (domain(state).interpretationConflicts || []).filter(item => item.status === 'unresolved')
+    .flatMap(item => (item.relatedClaimIds || []).map(claimId => ({
+      id:`${item.id}:${claimId}`, status:'needs_resolution', reasonCodes:[item.kind], sourceSchemaVersion:null,
+      migratedAt:item.createdAt, originalClaimId:claimId
+    })));
+  return [...legacy, ...ingestion];
 }
 
 export function projectUnmatchedReimbursementInflows(state, {asOf = null} = {}) {
   return domain(state).transactions
-    .filter(item => item.amountCents > 0 && item.movementType === 'reimbursement')
+    .filter(item => item.amountCents > 0 && item.movementType === 'reimbursement' && item.sourceLifecycle !== 'removed' && item.pendingStatus !== 'removed')
     .map(item => projectInflowAvailability(state, item.id, {asOf}))
     .filter(item => item.availableAmountCents > 0);
 }

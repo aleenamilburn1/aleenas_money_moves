@@ -1,5 +1,6 @@
 import {migrateState, validateFoundationDomain} from '../domain/migrations.js';
 import {getStateRevision} from './stateRevision.js';
+import {applyMutationBatchAtomically} from './ingestionService.js';
 
 export class LocalVaultAdoptionConflictError extends Error {
   constructor() {
@@ -85,6 +86,35 @@ export function createStateService({repository, seed, migrate = migrateState} = 
       const migration = migrateForUse(state);
       const saved = await repository.save(migration.state, key, meta, {expectedVaultGeneration, ...coordination});
       return {...saved, state:migration.state, migration};
+    },
+    async applyIngestionBatch(state, key, meta, batch, {
+      expectedVaultGeneration = meta?.vaultGeneration,
+      coordination = {},
+      idFactory,
+      now
+    } = {}) {
+      const migration = migrateForUse(state);
+      const applied = await applyMutationBatchAtomically(
+        migration.state,
+        batch,
+        nextState => repository.save(nextState, key, meta, {expectedVaultGeneration, ...coordination}),
+        {idFactory, now}
+      );
+      if (!applied.changed) {
+        return {
+          state:applied.state,
+          result:applied.result,
+          migration,
+          meta,
+          vaultGeneration:expectedVaultGeneration
+        };
+      }
+      return {
+        ...applied.persistence,
+        state:applied.state,
+        result:applied.result,
+        migration
+      };
     },
     async changePassphrase(state, currentPassphrase, nextPassphrase, {expectedVaultGeneration, coordination} = {}) {
       const migration = migrateForUse(state);

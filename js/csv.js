@@ -41,10 +41,9 @@ function firstValue(row, names) {
   return '';
 }
 
-function parseAmount(value) {
-  const cleaned = String(value || '').replace(/[$,()]/g, match => match === '(' ? '-' : '').replace(')','').trim();
-  const amount = Number(cleaned);
-  return Number.isFinite(amount) ? amount : 0;
+function parseAmount(value, signConvention) {
+  try { return parseExactUsdAmount(String(value || '').trim(), {signConvention, allowZero:false}); }
+  catch { return null; }
 }
 
 function normalizeDate(value) {
@@ -65,31 +64,26 @@ export function rowsToTransactions(rows, settings = {}) {
     const merchant = firstValue(row,['merchant_name','merchant','name','description','transaction','payee']);
     const normalizedAmountRaw = firstValue(row,['normalized_amount']);
     const amountRaw = normalizedAmountRaw || firstValue(row,['amount','debit','charge','transaction_amount','value']);
-    const rawAmount = parseAmount(amountRaw);
+    const parsedAmount = parseAmount(amountRaw, positiveMeansSpend ? 'positive_outflow' : 'money_moves_signed');
     const primary = String(firstValue(row,['personal_finance_category_primary','primary_category','category']) || '').toLowerCase();
     const detail = firstValue(row,['personal_finance_category_detailed','category_detail','subcategory']);
     const account = firstValue(row,['account_name','account','account_label','card']);
     const transactionId = firstValue(row,['transaction_id','id','transactionid']);
 
-    if (!date || !merchant || !Number.isFinite(rawAmount)) {
+    if (!date || !merchant || !parsedAmount) {
       rejected.push({row:index + 2, reason:'Missing date, merchant, or amount'});
       return;
     }
 
-    let flow = 'outflow';
-    if (primary === 'income' || primary.startsWith('income_')) flow = 'inflow';
-    else if (primary === 'transfers' || primary === 'transfer' || primary.startsWith('transfers_')) flow = 'transfer';
-    else if (!normalizedAmountRaw) {
-      const isSpend = positiveMeansSpend ? rawAmount >= 0 : rawAmount < 0;
-      flow = isSpend ? 'outflow' : 'inflow';
-    }
+    const flow = parsedAmount.amountCents > 0 ? 'inflow' : 'outflow';
 
     if (!includeMoneyMovement && flow !== 'outflow') return;
     transactions.push({
       id:transactionId || undefined,
       date,
       merchant:String(merchant),
-      amount:Math.abs(rawAmount),
+      amount:formatSignedCents(BigInt(Math.abs(parsedAmount.amountCents))),
+      amountCents:Math.abs(parsedAmount.amountCents),
       account:String(account || 'Imported account'),
       providerCategory:String(primary || ''),
       providerDetail:String(detail || ''),
@@ -99,3 +93,4 @@ export function rowsToTransactions(rows, settings = {}) {
 
   return {transactions, rejected};
 }
+import {formatSignedCents, parseExactUsdAmount} from './domain/exactMoney.js';

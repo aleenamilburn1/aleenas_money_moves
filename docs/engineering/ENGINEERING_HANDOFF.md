@@ -9,12 +9,12 @@
 - Original V2D candidate rejected at acceptance phase 2: `v2d-macos-release-candidate` (`0072b61`)
 - V2D Candidate 2 rejected at acceptance phase 2: `v2d-macos-release-candidate-2` (`32347a1`, `Harden macOS release verification`)
 - V2D Candidate 3 (`f912517`, `Restrict macOS JIT signing policy`) is independently accepted by `V2D_MACOS_SIGNING_NOTARIZATION_ACCEPTANCE.md`; annotated tag `v2d-macos-release-accepted` identifies the documentation-only acceptance checkpoint
-- Current domain schema: 9
+- Current domain schema: 10
 - Desktop package version: `2.0.0-desktop.0`
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
 - V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
 - V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Candidate 2 is independently accepted by `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`; annotated tag `v3-plaid-architecture-accepted` identifies the documentation-only acceptance checkpoint.
-- V3 remains documentation only. No V3 source, backend, schema, migration, dependency, credential, report, or behavior has been added.
+- V3A provider-neutral ingestion is implemented from the accepted architecture checkpoint and awaits independent acceptance. The annotated `v3a-provider-neutral-ingestion-candidate` tag identifies the candidate. It adds schema 10 and offline canonical ingestion only; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
 
 ## Desktop foundation
 
@@ -205,13 +205,52 @@ Electron suite, and diff-integrity checks. The acceptance commit/tag changes
 documentation status only; no test, product source, schema, migration,
 dependency, credential, or asset was added or changed.
 
+## V3A provider-neutral ingestion candidate
+
+Read `V3A_PROVIDER_NEUTRAL_INGESTION_IMPLEMENTATION.md` before reviewing or
+extending ingestion. V3A advances the encrypted domain from schema 9 to 10 and
+adds a closed, offline canonical mutation-batch contract. Manual, generic CSV,
+and synthetic fixture adapters normalize into the same account and transaction
+mutations. Exact decimal-string parsing, explicit sign profiles, source-key
+identity, durable batch receipts, USD-only active accounting, bounded currency
+quarantine, explicit pending-to-posted lineage, source history, tombstones, and
+interpretation conflicts are shared domain behavior rather than adapter policy.
+
+The reconciler is clone-first and validates the complete domain before handing
+one draft to the encrypted repository. Source fields cannot overwrite friendly
+account names, visibility, review, movement type, notes, allocations, claims, or
+other user meaning. Incompatible source corrections preserve that meaning in a
+resolution snapshot and exclude superseded allocations from active totals.
+Known removals retain canonical rows and user evidence; unknown removals retain
+source tombstones. Same-key replay is idempotent, while semantic lookalikes are
+never merged.
+
+The existing CSV entry point now uses the canonical batch path. No new Reports,
+quarantine, or conflict-resolution screen was added. No provider product,
+network, backend, token, credential, cursor, webhook, FX, or hosted persistence
+exists in V3A. Quarter boundaries retain detailed source and user history for a
+future local V3R phase without implementing report calculations or snapshots.
+
+Fresh candidate validation passed:
+
+- `CI=true pnpm run check`: passed.
+- `CI=true pnpm test`: 261 passed, 0 failed, 0 skipped, 0 todo.
+- `CI=true pnpm run electron:test`: 38 passed, 0 failed, 0 skipped, 0 todo.
+- Focused V3A suite: 32 passed, 0 failed, 0 skipped, 0 todo.
+- `git diff --check` and the forbidden-capability/security scans: passed.
+
+These are implementation results, not independent acceptance. The candidate is
+identified by annotated tag `v3a-provider-neutral-ingestion-candidate`; V3B may
+begin only after a separate V3A review records acceptance.
+
 ## Recommended next task
 
-Open a bounded V3A provider-neutral ingestion implementation task. Read the PRD,
-the four V3 architecture documents, and `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`
-first. V3A must preserve/migrate schema-9 data, implement the offline canonical
-contract and adversarial fixtures, and use no Plaid/network dependency or
-credential. Do not begin V3B, V3C, V3D, V3R, or V3E until each preceding phase
-receives its own implementation and independent acceptance. The remaining human
-Finder/Dock/application-switcher icon-cache visual check remains a low-risk V2D
-release follow-up.
+Open a bounded independent V3A acceptance task from the candidate tag. Re-read
+the PRD, all four V3 architecture documents, the architecture acceptance, and
+the V3A implementation report; independently review schema-9 migration, source
+identity, exact money, ownership, reconciliation, atomic persistence, backup,
+history retention, and scope/privacy boundaries. Repeat the 261-unit and
+38-Electron gates and record acceptance or rejection separately. Do not begin
+V3B, V3C, V3D, V3R, or V3E until each preceding phase receives its own
+implementation and independent acceptance. The remaining human Finder/Dock/
+application-switcher icon-cache visual check remains a low-risk V2D follow-up.

@@ -1,0 +1,723 @@
+import {STATE_SCHEMA_VERSION, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
+import {stableCanonicalJson, validateSourceMutationBatch} from '../domain/ingestionContract.js';
+import {isAllocationActive, validateDomainStore} from '../domain/models.js';
+import {advanceStateRevision} from './stateRevision.js';
+
+const clone = value => value === undefined ? undefined : structuredClone(value);
+
+export class IngestionApplyError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'IngestionApplyError';
+    this.code = code;
+  }
+}
+
+function fail(code, message) {
+  throw new IngestionApplyError(code, message);
+}
+
+function clean(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function nextId(idFactory, prefix) {
+  const value = clean(idFactory(prefix));
+  if (!value) fail('INVALID_LOCAL_ID', 'The local identifier factory returned an invalid identifier.');
+  return value;
+}
+
+function defaultIdFactory(prefix) {
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
+function sourceKey(sourceKind, sourceNamespace, sourceRef) {
+  return `${sourceKind}\u001f${sourceNamespace}\u001f${sourceRef}`;
+}
+
+function ensureCollections(domain) {
+  for (const field of [
+    'ingestionReceipts', 'sourceQuarantines', 'sourceTombstones', 'interpretationConflicts', 'sourceAuditEvents'
+  ]) domain[field] = Array.isArray(domain[field]) ? domain[field] : [];
+}
+
+function accountIndex(domain) {
+  return new Map(domain.accounts.filter(account => account.sourceKind).map(account => [
+    sourceKey(account.sourceKind, account.sourceNamespace, account.sourceAccountRef), account
+  ]));
+}
+
+function transactionIndex(domain) {
+  const result = new Map();
+  for (const transaction of domain.transactions) {
+    if (!transaction.sourceKind) continue;
+    result.set(sourceKey(transaction.sourceKind, transaction.sourceNamespace, transaction.sourceRecordRef), {transaction, alias:null});
+    for (const alias of transaction.sourceRefAliases || []) {
+      result.set(sourceKey(transaction.sourceKind, transaction.sourceNamespace, alias.sourceRecordRef), {transaction, alias});
+    }
+  }
+  return result;
+}
+
+function sourceAccountFields(record) {
+  return {
+    officialName:record.officialName,
+    providerDisplayName:record.providerDisplayName,
+    institutionName:record.institution.name,
+    institutionId:record.institution.sourceInstitutionRef,
+    type:record.type,
+    subtype:record.subtype,
+    mask:record.mask,
+    currency:record.currency,
+    sourceStatus:record.sourceStatus,
+    balances:clone(record.balances),
+    balanceCents:record.balances?.currentCents ?? null,
+    sourceMetadata:clone(record.metadata)
+  };
+}
+
+function accountFactsEqual(account, record) {
+  const current = sourceAccountFields({
+    officialName:account.officialName ?? null,
+    providerDisplayName:account.providerDisplayName ?? null,
+    institution:{sourceInstitutionRef:account.institutionId ?? null, name:account.institutionName ?? null},
+    type:account.type,
+    subtype:account.subtype ?? null,
+    mask:account.mask ?? null,
+    currency:account.currency ?? null,
+    sourceStatus:account.sourceStatus ?? 'unknown',
+    balances:account.balances ?? null,
+    metadata:account.sourceMetadata ?? {}
+  });
+  return stableCanonicalJson(current) === stableCanonicalJson(sourceAccountFields(record));
+}
+
+function sourceAudit(domain, {idFactory, batch, entityType, entityId, action, changedFields, observedAt, now}) {
+  domain.sourceAuditEvents.push({
+    id:nextId(idFactory, 'source-audit'),
+    batchId:batch.batchId,
+    entityType,
+    entityId,
+    action,
+    changedFields:[...new Set(changedFields)].sort(),
+    observedAt,
+    createdAt:now,
+    updatedAt:now
+  });
+}
+
+function localAccountFromMutation(batch, mutation, {idFactory, now}) {
+  const source = mutation.account;
+  const friendlyName = clean(source.officialName || source.providerDisplayName) || 'Unnamed account';
+  return {
+    id:nextId(idFactory, 'account'),
+    institutionId:source.institution.sourceInstitutionRef,
+    externalAccountId:mutation.sourceAccountRef,
+    friendlyName,
+    officialName:source.officialName,
+    mask:source.mask,
+    type:source.type,
+    subtype:source.subtype,
+    currency:source.currency,
+    source:batch.sourceKind,
+    active:true,
+    balanceCents:source.balances?.currentCents ?? null,
+    sourceKind:batch.sourceKind,
+    sourceNamespace:batch.sourceNamespace,
+    sourceAccountRef:mutation.sourceAccountRef,
+    connectionId:batch.sourceKind === 'provider' ? batch.sourceNamespace : null,
+    institutionName:source.institution.name,
+    providerDisplayName:source.providerDisplayName,
+    enabled:true,
+    hidden:false,
+    sourceStatus:source.sourceStatus,
+    connectionStatus:source.sourceStatus === 'active' ? 'healthy' : source.sourceStatus,
+    sourceMetadata:clone(source.metadata),
+    balances:clone(source.balances),
+    sourceObservedAt:mutation.observedAt,
+    createdAt:now,
+    updatedAt:now
+  };
+}
+
+function applyAccountAddsAndModifications(domain, batch, context, index, counts) {
+  for (const mutation of batch.accountMutations.filter(item => item.kind !== 'disconnect')) {
+    if (mutation.sourceAccountRef === 'unknown-account') continue;
+    const key = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef);
+    const existing = index.get(key);
+    if (!existing) {
+      if (mutation.kind !== 'add') fail('UNKNOWN_ACCOUNT_MODIFICATION', 'An account modification referenced an unknown source account.');
+      const account = localAccountFromMutation(batch, mutation, context);
+      domain.accounts.push(account);
+      index.set(key, account);
+      counts.accountsAdded += 1;
+      sourceAudit(domain, {...context, batch, entityType:'account', entityId:account.id, action:'added', changedFields:['source'], observedAt:mutation.observedAt});
+      continue;
+    }
+    if (mutation.kind === 'add') {
+      if (!accountFactsEqual(existing, mutation.account)) fail('ACCOUNT_ADD_CONFLICT', 'An account add conflicts with existing source facts.');
+      continue;
+    }
+    if (accountFactsEqual(existing, mutation.account)) continue;
+    const before = sourceAccountFields({
+      officialName:existing.officialName ?? null,
+      providerDisplayName:existing.providerDisplayName ?? null,
+      institution:{sourceInstitutionRef:existing.institutionId ?? null, name:existing.institutionName ?? null},
+      type:existing.type,
+      subtype:existing.subtype ?? null,
+      mask:existing.mask ?? null,
+      currency:existing.currency ?? null,
+      sourceStatus:existing.sourceStatus ?? 'unknown',
+      balances:existing.balances ?? null,
+      metadata:existing.sourceMetadata ?? {}
+    });
+    const after = sourceAccountFields(mutation.account);
+    const changedFields = Object.keys(after).filter(field => stableCanonicalJson(before[field]) !== stableCanonicalJson(after[field]));
+    Object.assign(existing, after, {sourceObservedAt:mutation.observedAt, updatedAt:context.now});
+    counts.accountsUpdated += 1;
+    sourceAudit(domain, {...context, batch, entityType:'account', entityId:existing.id, action:'modified', changedFields, observedAt:mutation.observedAt});
+  }
+}
+
+function resolveLocalAccount(domain, batch, sourceAccountRef, index) {
+  if (sourceAccountRef === 'unknown-account') return domain.accounts.find(account => account.id === UNKNOWN_ACCOUNT_ID) || null;
+  return index.get(sourceKey(batch.sourceKind, batch.sourceNamespace, sourceAccountRef)) || null;
+}
+
+function recordSourceFacts(record) {
+  return {
+    sourceLifecycle:record.lifecycle,
+    amountCents:record.amountCents,
+    currency:record.currency,
+    sourceAmount:clone(record.sourceAmount),
+    sourceDate:record.sourceDate,
+    authorizedDate:record.authorizedDate,
+    sourceAuthorizedAt:record.authorizedAt,
+    postedDate:record.postedDate,
+    sourcePostedAt:record.postedAt,
+    rawDescription:record.rawDescription,
+    displayDescription:record.displayDescription,
+    sourceMerchant:clone(record.merchant),
+    providerCategoryMetadata:clone(record.providerCategory),
+    paymentChannel:record.paymentChannel,
+    sourceLocation:clone(record.location),
+    sourceRevision:record.sourceRevision,
+    sourceUpdatedAt:record.sourceUpdatedAt,
+    sourceMetadata:clone(record.metadata)
+  };
+}
+
+function transactionCurrentFacts(transaction) {
+  return {
+    sourceLifecycle:transaction.sourceLifecycle,
+    amountCents:transaction.amountCents,
+    currency:transaction.currency,
+    sourceAmount:clone(transaction.sourceAmount),
+    sourceDate:transaction.sourceDate,
+    authorizedDate:transaction.authorizedDate,
+    sourceAuthorizedAt:transaction.sourceAuthorizedAt ?? null,
+    postedDate:transaction.postedDate,
+    sourcePostedAt:transaction.sourcePostedAt ?? null,
+    rawDescription:transaction.rawDescription,
+    displayDescription:transaction.displayDescription,
+    sourceMerchant:clone(transaction.sourceMerchant ?? null),
+    providerCategoryMetadata:clone(transaction.providerCategoryMetadata ?? null),
+    paymentChannel:transaction.paymentChannel ?? null,
+    sourceLocation:clone(transaction.sourceLocation ?? {region:transaction.locationRegion ?? null, country:transaction.locationCountry ?? null, source:transaction.locationSource ?? 'unavailable'}),
+    sourceRevision:transaction.sourceProvenance?.sourceRevision ?? null,
+    sourceUpdatedAt:transaction.sourceProvenance?.sourceUpdatedAt ?? null,
+    sourceMetadata:clone(transaction.sourceMetadata ?? {})
+  };
+}
+
+function sourceFactsEqual(transaction, record) {
+  return stableCanonicalJson(transactionCurrentFacts(transaction)) === stableCanonicalJson(recordSourceFacts(record));
+}
+
+function historySnapshot(transaction, batch, observedAt) {
+  return {
+    observedAt,
+    batchId:batch.batchId,
+    sourceRecordRef:transaction.sourceRecordRef,
+    ...transactionCurrentFacts(transaction)
+  };
+}
+
+function sourceChangedFields(transaction, record) {
+  const before = transactionCurrentFacts(transaction);
+  const after = recordSourceFacts(record);
+  return Object.keys(after).filter(field => stableCanonicalJson(before[field]) !== stableCanonicalJson(after[field]));
+}
+
+function relatedClaimIds(domain, allocations) {
+  const allocationIds = new Set(allocations.map(item => item.id));
+  return [...new Set(domain.reimbursementClaimAllocations
+    .filter(link => allocationIds.has(link.allocationId))
+    .map(link => link.claimId))].sort();
+}
+
+function createInterpretationConflict(domain, transaction, batch, context, {
+  kind,
+  nextAmountCents,
+  nextCurrency,
+  supersedeAllocations
+}) {
+  if (transaction.interpretationConflictId) return domain.interpretationConflicts.find(item => item.id === transaction.interpretationConflictId) || null;
+  const allocations = domain.allocations.filter(item => item.transactionId === transaction.id && isAllocationActive(item));
+  const conflict = {
+    id:nextId(context.idFactory, 'interpretation-conflict'),
+    batchId:batch.batchId,
+    transactionId:transaction.id,
+    kind,
+    status:'unresolved',
+    previousReviewStatus:transaction.reviewStatus,
+    previousMovementType:transaction.movementType,
+    previousAmountCents:transaction.amountCents,
+    nextAmountCents:nextAmountCents ?? null,
+    previousCurrency:transaction.currency ?? null,
+    nextCurrency:nextCurrency ?? null,
+    allocationSnapshot:clone(allocations),
+    relatedClaimIds:relatedClaimIds(domain, allocations),
+    manualOverridesSnapshot:clone(transaction.manualOverrides ?? null),
+    userNoteSnapshot:transaction.userNote ?? null,
+    createdAt:context.now,
+    updatedAt:context.now
+  };
+  domain.interpretationConflicts.push(conflict);
+  if (supersedeAllocations) for (const allocation of allocations) {
+    allocation.status = 'superseded';
+    allocation.supersededByConflictId = conflict.id;
+    allocation.updatedAt = context.now;
+  }
+  transaction.interpretationConflictId = conflict.id;
+  transaction.reviewStatus = 'needs_resolution';
+  return conflict;
+}
+
+function applyRecordToTransaction(domain, transaction, mutation, batch, context, counts) {
+  const record = mutation.record;
+  if (sourceFactsEqual(transaction, record)) return false;
+  const changedFields = sourceChangedFields(transaction, record);
+  const activeAllocations = domain.allocations.filter(item => item.transactionId === transaction.id && isAllocationActive(item));
+  const allocationTotal = activeAllocations.reduce((sum, item) => sum + item.amountCents, 0);
+  const incompatible = activeAllocations.length > 0 && (
+    allocationTotal !== Math.abs(record.amountCents)
+    || Math.sign(transaction.amountCents) !== Math.sign(record.amountCents)
+    || transaction.currency !== record.currency
+  );
+  transaction.sourceHistory.push(historySnapshot(transaction, batch, mutation.observedAt));
+  if (incompatible) {
+    const existingConflictId = transaction.interpretationConflictId;
+    createInterpretationConflict(domain, transaction, batch, context, {
+      kind:'source_amount_changed',
+      nextAmountCents:record.amountCents,
+      nextCurrency:record.currency,
+      supersedeAllocations:true
+    });
+    if (!existingConflictId && transaction.interpretationConflictId) counts.interpretationConflicts += 1;
+  }
+  const facts = recordSourceFacts(record);
+  Object.assign(transaction, facts, {
+    rawName:record.rawDescription,
+    merchantName:record.merchant?.name ?? record.displayDescription,
+    authorizedAt:record.authorizedAt ?? record.authorizedDate,
+    postedAt:record.postedAt ?? record.postedDate,
+    displayDate:record.postedDate ?? record.sourceDate ?? record.authorizedDate,
+    pendingStatus:record.lifecycle,
+    locationRegion:record.location.region,
+    locationCountry:record.location.country,
+    locationSource:record.location.source,
+    providerCategory:record.providerCategory?.primary ?? null,
+    sourceProvenance:{
+      adapterKind:batch.adapterKind,
+      observedAt:mutation.observedAt,
+      sourceRevision:record.sourceRevision,
+      sourceUpdatedAt:record.sourceUpdatedAt,
+      migratedFromSchema:null
+    },
+    updatedAt:context.now
+  });
+  counts.transactionsUpdated += 1;
+  sourceAudit(domain, {...context, batch, entityType:'transaction', entityId:transaction.id, action:'modified', changedFields, observedAt:mutation.observedAt});
+  return true;
+}
+
+function localTransactionFromMutation(batch, mutation, account, context) {
+  const record = mutation.record;
+  const facts = recordSourceFacts(record);
+  return {
+    id:nextId(context.idFactory, 'transaction'),
+    accountId:account.id,
+    source:batch.sourceKind,
+    sourceTransactionId:mutation.sourceRecordRef,
+    rawName:record.rawDescription,
+    merchantName:record.merchant?.name ?? record.displayDescription,
+    amountCents:record.amountCents,
+    currency:record.currency,
+    authorizedAt:record.authorizedAt ?? record.authorizedDate,
+    postedAt:record.postedAt ?? record.postedDate,
+    displayDate:record.postedDate ?? record.sourceDate ?? record.authorizedDate,
+    pendingStatus:record.lifecycle,
+    movementType:'unclassified',
+    reviewStatus:'pending',
+    locationRegion:record.location.region,
+    locationCountry:record.location.country,
+    locationSource:record.location.source,
+    providerCategory:record.providerCategory?.primary ?? null,
+    manualOverrides:null,
+    userNote:null,
+    sourceKind:batch.sourceKind,
+    sourceNamespace:batch.sourceNamespace,
+    sourceRecordRef:mutation.sourceRecordRef,
+    sourceAccountRef:mutation.sourceAccountRef,
+    ...facts,
+    sourceProvenance:{
+      adapterKind:batch.adapterKind,
+      observedAt:mutation.observedAt,
+      sourceRevision:record.sourceRevision,
+      sourceUpdatedAt:record.sourceUpdatedAt,
+      migratedFromSchema:null
+    },
+    sourceRefAliases:[],
+    predecessorTransactionId:null,
+    predecessorSourceRef:record.predecessorSourceRef,
+    tombstone:null,
+    interpretationConflictId:null,
+    sourceHistory:[],
+    createdAt:context.now,
+    updatedAt:context.now
+  };
+}
+
+function syncLegacyReviewProjection(state, transaction, account) {
+  state.review ||= {};
+  state.review.transactions = Array.isArray(state.review.transactions) ? state.review.transactions : [];
+  let projection = state.review.transactions.find(item => item.id === transaction.id);
+  if (!projection) {
+    projection = {id:transaction.id, bucketId:null, reviewedAt:null};
+    state.review.transactions.push(projection);
+  }
+  const date = transaction.displayDate || transaction.sourceDate || transaction.createdAt.slice(0, 10);
+  Object.assign(projection, {
+    canonicalTransactionId:transaction.id,
+    sourceRecordRef:transaction.sourceRecordRef,
+    date,
+    weekStart:weekStartUtc(date),
+    merchant:transaction.merchantName || transaction.rawName || 'Unknown merchant',
+    merchantKey:clean(transaction.merchantName || transaction.rawName).toLocaleLowerCase(),
+    name:transaction.rawName || transaction.merchantName || 'Unknown merchant',
+    amount:Math.abs(transaction.amountCents) / 100,
+    amountCents:Math.abs(transaction.amountCents),
+    account:account?.friendlyName || 'Unknown account',
+    providerCategory:transaction.providerCategory || '',
+    providerDetail:transaction.providerCategoryMetadata?.detailed || '',
+    flow:transaction.amountCents > 0 ? 'inflow' : 'outflow',
+    reviewStatus:transaction.reviewStatus,
+    source:`v3a-${transaction.sourceKind}`,
+    importedAt:transaction.createdAt,
+    pending:transaction.sourceLifecycle === 'pending',
+    removed:transaction.sourceLifecycle === 'removed'
+  });
+}
+
+function weekStartUtc(value) {
+  const date = new Date(`${String(value).slice(0, 10)}T12:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
+  const day = date.getUTCDay();
+  date.setUTCDate(date.getUTCDate() - (day === 0 ? 6 : day - 1));
+  return date.toISOString().slice(0, 10);
+}
+
+function applyOrdinaryTransactionMutations(state, domain, batch, context, accounts, transactions, counts) {
+  const ordinary = batch.transactionMutations.filter(item => item.kind !== 'remove' && !item.record.predecessorSourceRef);
+  for (const mutation of ordinary) {
+    const account = resolveLocalAccount(domain, batch, mutation.sourceAccountRef, accounts);
+    if (!account) fail('MISSING_LOCAL_ACCOUNT', 'A transaction does not resolve to a local account.');
+    const key = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceRecordRef);
+    const existing = transactions.get(key)?.transaction || null;
+    if (mutation.kind === 'add') {
+      if (!existing) {
+        const transaction = localTransactionFromMutation(batch, mutation, account, context);
+        domain.transactions.push(transaction);
+        transactions.set(key, {transaction, alias:null});
+        counts.transactionsAdded += 1;
+        sourceAudit(domain, {...context, batch, entityType:'transaction', entityId:transaction.id, action:'added', changedFields:['source'], observedAt:mutation.observedAt});
+        syncLegacyReviewProjection(state, transaction, account);
+      } else if (existing.sourceLifecycle === 'removed' && existing.sourceRecordRef === mutation.sourceRecordRef) {
+        const removalConflict = domain.interpretationConflicts.find(item => item.id === existing.interpretationConflictId && item.kind === 'source_removed');
+        if (removalConflict) {
+          existing.reviewStatus = removalConflict.previousReviewStatus;
+          removalConflict.status = 'resolved';
+          removalConflict.updatedAt = context.now;
+          existing.interpretationConflictId = null;
+        }
+        existing.tombstone = null;
+        applyRecordToTransaction(domain, existing, mutation, batch, context, counts);
+        existing.sourceLifecycle = mutation.record.lifecycle;
+        existing.pendingStatus = mutation.record.lifecycle;
+        syncLegacyReviewProjection(state, existing, account);
+      } else if (!sourceFactsEqual(existing, mutation.record)) {
+        fail('TRANSACTION_ADD_CONFLICT', 'A transaction add conflicts with existing source facts.');
+      }
+    } else {
+      if (!existing) fail('UNKNOWN_TRANSACTION_MODIFICATION', 'A transaction modification referenced an unknown source record.');
+      if (existing.accountId !== account.id) fail('SOURCE_ACCOUNT_CHANGE_REQUIRES_REVIEW', 'A source modification cannot silently move a transaction between local accounts.');
+      applyRecordToTransaction(domain, existing, mutation, batch, context, counts);
+      syncLegacyReviewProjection(state, existing, account);
+    }
+  }
+}
+
+function applyPendingPostedTransitions(state, domain, batch, context, accounts, transactions, counts) {
+  for (const mutation of batch.transactionMutations.filter(item => item.kind === 'add' && item.record.predecessorSourceRef)) {
+    const account = resolveLocalAccount(domain, batch, mutation.sourceAccountRef, accounts);
+    if (!account) fail('MISSING_LOCAL_ACCOUNT', 'A posted transaction does not resolve to a local account.');
+    if (mutation.record.lifecycle !== 'posted') fail('INVALID_PREDECESSOR_TRANSITION', 'Only a posted record may replace a predecessor.');
+    const postedKey = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceRecordRef);
+    const existingPosted = transactions.get(postedKey);
+    if (existingPosted) {
+      const hasExpectedAlias = !existingPosted.alias && (existingPosted.transaction.sourceRefAliases || [])
+        .some(alias => alias.sourceRecordRef === mutation.record.predecessorSourceRef);
+      if (!hasExpectedAlias || existingPosted.transaction.accountId !== account.id) {
+        fail('POSTED_SOURCE_COLLISION', 'The posted source reference already maps to incompatible source history.');
+      }
+      if (!sourceFactsEqual(existingPosted.transaction, mutation.record)) {
+        fail('TRANSACTION_ADD_CONFLICT', 'A repeated posted add conflicts with current source facts.');
+      }
+      continue;
+    }
+    const predecessorKey = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.record.predecessorSourceRef);
+    const predecessorEntry = transactions.get(predecessorKey);
+    if (!predecessorEntry || predecessorEntry.alias) fail('MISSING_PREDECESSOR', 'The explicit predecessor does not resolve to one current transaction.');
+    const transaction = predecessorEntry.transaction;
+    if (transaction.sourceLifecycle !== 'pending' || transaction.accountId !== account.id || transaction.sourceAccountRef !== mutation.sourceAccountRef) {
+      fail('INVALID_PREDECESSOR_TRANSITION', 'The explicit predecessor is not a pending record on the same source account.');
+    }
+    const postedCollision = transactions.get(postedKey);
+    if (postedCollision && postedCollision.transaction.id !== transaction.id) fail('POSTED_SOURCE_COLLISION', 'The posted source reference already maps to another transaction.');
+    const priorRef = transaction.sourceRecordRef;
+    const updated = applyRecordToTransaction(domain, transaction, mutation, batch, context, counts);
+    transaction.sourceRefAliases.push({sourceRecordRef:priorRef, lifecycle:'removed', observedAt:mutation.observedAt});
+    transaction.sourceRecordRef = mutation.sourceRecordRef;
+    transaction.sourceTransactionId = mutation.sourceRecordRef;
+    transaction.predecessorSourceRef = priorRef;
+    transactions.delete(predecessorKey);
+    transactions.set(predecessorKey, {transaction, alias:transaction.sourceRefAliases.at(-1)});
+    transactions.set(postedKey, {transaction, alias:null});
+    if (!updated) {
+      transaction.sourceLifecycle = 'posted';
+      transaction.pendingStatus = 'posted';
+      transaction.updatedAt = context.now;
+    }
+    counts.pendingPostedTransitions += 1;
+    syncLegacyReviewProjection(state, transaction, account);
+  }
+}
+
+function hasUserWork(domain, transaction) {
+  return transaction.reviewStatus !== 'pending'
+    || transaction.movementType !== 'unclassified'
+    || domain.allocations.some(item => item.transactionId === transaction.id)
+    || Boolean(transaction.userNote)
+    || Boolean(transaction.manualOverrides)
+    || domain.reimbursementPaymentLinks.some(item => item.inflowTransactionId === transaction.id);
+}
+
+function tombstoneTransaction(state, domain, transaction, batch, context, {reason, observedAt, successorTransactionId = null, conflictKind = 'source_removed'}, counts) {
+  if (transaction.sourceLifecycle === 'removed' && transaction.tombstone?.reason === reason) return false;
+  transaction.sourceHistory.push(historySnapshot(transaction, batch, observedAt));
+  if (hasUserWork(domain, transaction)) {
+    const existingConflictId = transaction.interpretationConflictId;
+    createInterpretationConflict(domain, transaction, batch, context, {
+      kind:conflictKind,
+      nextAmountCents:null,
+      nextCurrency:null,
+      supersedeAllocations:false
+    });
+    if (!existingConflictId && transaction.interpretationConflictId) counts.interpretationConflicts += 1;
+  }
+  transaction.sourceLifecycle = 'removed';
+  transaction.pendingStatus = 'removed';
+  transaction.tombstone = {
+    reason,
+    observedAt,
+    successorTransactionId,
+    priorSourceRecordRef:transaction.sourceRecordRef
+  };
+  transaction.updatedAt = context.now;
+  counts.transactionsTombstoned += 1;
+  sourceAudit(domain, {...context, batch, entityType:'transaction', entityId:transaction.id, action:'tombstoned', changedFields:['sourceLifecycle', 'tombstone'], observedAt});
+  const account = domain.accounts.find(item => item.id === transaction.accountId);
+  syncLegacyReviewProjection(state, transaction, account);
+  return true;
+}
+
+function applyRemovals(state, domain, batch, context, transactions, counts) {
+  for (const mutation of batch.transactionMutations.filter(item => item.kind === 'remove')) {
+    const key = sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceRecordRef);
+    const entry = transactions.get(key);
+    if (entry?.alias) {
+      entry.alias.lifecycle = 'removed';
+      entry.alias.observedAt = mutation.observedAt;
+      continue;
+    }
+    if (entry) {
+      tombstoneTransaction(state, domain, entry.transaction, batch, context, {
+        reason:mutation.removal.reason,
+        observedAt:mutation.observedAt,
+        successorTransactionId:null
+      }, counts);
+      continue;
+    }
+    const tombstoneId = `source-tombstone-${batch.payloadDigest.slice(0, 12)}-${domain.sourceTombstones.length + 1}`;
+    if (domain.sourceTombstones.some(item => item.sourceKind === batch.sourceKind && item.sourceNamespace === batch.sourceNamespace && item.sourceRecordRef === mutation.sourceRecordRef)) continue;
+    domain.sourceTombstones.push({
+      id:tombstoneId,
+      batchId:batch.batchId,
+      sourceKind:batch.sourceKind,
+      sourceNamespace:batch.sourceNamespace,
+      sourceRecordRef:mutation.sourceRecordRef,
+      sourceAccountRef:mutation.sourceAccountRef,
+      reason:mutation.removal.reason,
+      predecessorOfRef:mutation.removal.predecessorOfRef,
+      observedAt:mutation.observedAt,
+      createdAt:context.now,
+      updatedAt:context.now
+    });
+    sourceAudit(domain, {...context, batch, entityType:'source_tombstone', entityId:tombstoneId, action:'unknown_removal_recorded', changedFields:['sourceLifecycle'], observedAt:mutation.observedAt});
+  }
+}
+
+function applyAccountDisconnects(domain, batch, context, index, counts) {
+  for (const mutation of batch.accountMutations.filter(item => item.kind === 'disconnect')) {
+    if (mutation.sourceAccountRef === 'unknown-account') fail('INVALID_UNKNOWN_ACCOUNT_DISCONNECT', 'The explicit Unknown account cannot be disconnected by a source.');
+    const account = index.get(sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef));
+    if (!account) fail('UNKNOWN_ACCOUNT_DISCONNECT', 'An account disconnect referenced an unknown source account.');
+    if (account.sourceStatus === 'disconnected') continue;
+    account.sourceStatus = 'disconnected';
+    account.connectionStatus = 'disconnected';
+    account.sourceObservedAt = mutation.observedAt;
+    account.updatedAt = context.now;
+    counts.accountsDisconnected += 1;
+    sourceAudit(domain, {...context, batch, entityType:'account', entityId:account.id, action:'disconnected', changedFields:['sourceStatus', 'connectionStatus'], observedAt:mutation.observedAt});
+  }
+}
+
+function applyQuarantines(state, domain, batch, context, transactions, counts) {
+  for (const item of batch.quarantinedRecords) {
+    const existing = domain.sourceQuarantines.find(value => value.sourceKind === batch.sourceKind
+      && value.sourceNamespace === batch.sourceNamespace && value.sourceRecordRef === item.sourceRecordRef && value.active);
+    if (!existing) {
+      const quarantine = {
+        id:`source-quarantine-${batch.payloadDigest.slice(0, 12)}-${domain.sourceQuarantines.length + 1}`,
+        batchId:batch.batchId,
+        sourceKind:batch.sourceKind,
+        sourceNamespace:batch.sourceNamespace,
+        sourceRecordRef:item.sourceRecordRef,
+        sourceAccountRef:item.sourceAccountRef,
+        observedAt:item.observedAt,
+        reason:item.reason,
+        rawAmountDecimal:item.rawAmountDecimal,
+        sourceCurrency:item.sourceCurrency,
+        safeDetailCode:item.safeDetailCode,
+        active:true,
+        resolvedAt:null,
+        createdAt:context.now,
+        updatedAt:context.now
+      };
+      domain.sourceQuarantines.push(quarantine);
+      counts.sourceRecordsQuarantined += 1;
+      sourceAudit(domain, {...context, batch, entityType:'quarantine', entityId:quarantine.id, action:'quarantined', changedFields:['reason', 'sourceCurrency'], observedAt:item.observedAt});
+    }
+    const entry = transactions.get(sourceKey(batch.sourceKind, batch.sourceNamespace, item.sourceRecordRef));
+    if (entry && !entry.alias && entry.transaction.sourceLifecycle !== 'removed') {
+      tombstoneTransaction(state, domain, entry.transaction, batch, context, {
+        reason:'source_quarantined',
+        observedAt:item.observedAt,
+        conflictKind:'source_quarantined'
+      }, counts);
+    }
+  }
+}
+
+function resultCounts() {
+  return {
+    accountsAdded:0,
+    accountsUpdated:0,
+    accountsDisconnected:0,
+    transactionsAdded:0,
+    transactionsUpdated:0,
+    transactionsTombstoned:0,
+    pendingPostedTransitions:0,
+    interpretationConflicts:0,
+    sourceRecordsQuarantined:0
+  };
+}
+
+export async function reconcileMutationBatch(state, batch, {idFactory = defaultIdFactory, now = batch?.producedAt} = {}) {
+  if (state?.schemaVersion !== STATE_SCHEMA_VERSION) fail('UNSUPPORTED_SCHEMA', `Ingestion requires vault schema ${STATE_SCHEMA_VERSION}.`);
+  await validateSourceMutationBatch(batch);
+  const priorReceipt = state.domain?.ingestionReceipts?.find(item => item.batchId === batch.batchId);
+  if (priorReceipt) {
+    if (priorReceipt.payloadDigest !== batch.payloadDigest) fail('BATCH_ID_COLLISION', 'A batch identifier was reused for different content.');
+    return {
+      state:clone(state),
+      changed:false,
+      result:{...clone(priorReceipt.result), status:'already_applied'}
+    };
+  }
+
+  const next = clone(state);
+  const domain = next.domain;
+  if (!domain || !Array.isArray(domain.accounts) || !Array.isArray(domain.transactions)) fail('INVALID_DOMAIN_STATE', 'The canonical financial store is unavailable.');
+  ensureCollections(domain);
+  const context = {idFactory, now};
+  const counts = resultCounts();
+  const accounts = accountIndex(domain);
+  const transactions = transactionIndex(domain);
+
+  applyAccountAddsAndModifications(domain, batch, context, accounts, counts);
+  applyOrdinaryTransactionMutations(next, domain, batch, context, accounts, transactions, counts);
+  applyPendingPostedTransitions(next, domain, batch, context, accounts, transactions, counts);
+  applyRemovals(next, domain, batch, context, transactions, counts);
+  applyAccountDisconnects(domain, batch, context, accounts, counts);
+  applyQuarantines(next, domain, batch, context, transactions, counts);
+  if (counts.transactionsAdded > 0 && Array.isArray(next.review?.transactions)) {
+    const weeks = [...new Set(next.review.transactions.map(item => item.weekStart).filter(Boolean))].sort((left, right) => right.localeCompare(left));
+    if (weeks.length) next.review.selectedWeek = weeks[0];
+  }
+
+  const status = counts.interpretationConflicts > 0 ? 'conflict'
+    : counts.sourceRecordsQuarantined > 0 ? 'quarantined' : 'applied';
+  const result = {
+    batchId:batch.batchId,
+    payloadDigest:batch.payloadDigest,
+    status,
+    counts,
+    safeErrorCodes:batch.sourceWarnings.map(item => item.code),
+    receipt:{connectionId:batch.sourceKind === 'provider' ? batch.sourceNamespace : null, batchId:batch.batchId, payloadDigest:batch.payloadDigest}
+  };
+  domain.ingestionReceipts.push({
+    id:`ingestion-receipt-${batch.payloadDigest.slice(0, 20)}`,
+    batchId:batch.batchId,
+    payloadDigest:batch.payloadDigest,
+    sourceKind:batch.sourceKind,
+    sourceNamespace:batch.sourceNamespace,
+    adapterKind:batch.adapterKind,
+    result:clone(result),
+    createdAt:now,
+    updatedAt:now
+  });
+  advanceStateRevision(next);
+  const validation = validateDomainStore(domain);
+  if (!validation.ok) fail('DOMAIN_VALIDATION_FAILED', `The reconciled domain is invalid: ${validation.errors.join('; ')}`);
+  return {state:next, result, changed:true};
+}
+
+export async function applyMutationBatchAtomically(state, batch, persist, options = {}) {
+  if (typeof persist !== 'function') fail('PERSISTENCE_REQUIRED', 'Atomic ingestion requires a persistence callback.');
+  const reconciled = await reconcileMutationBatch(state, batch, options);
+  if (!reconciled.changed) return {...reconciled, persistence:null};
+  const persistence = await persist(reconciled.state);
+  return {...reconciled, persistence};
+}

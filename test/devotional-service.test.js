@@ -47,7 +47,7 @@ test('schema 8 migrates financial state non-destructively into schema 9 devotion
   const migrated = migrateState(schema8, {now:NEXT});
   assert.equal(migrated.fromVersion, 8);
   assert.equal(migrated.toVersion, STATE_SCHEMA_VERSION);
-  assert.deepEqual(migrated.applied, ['v2c-faith-money-devotional-state']);
+  assert.deepEqual(migrated.applied, ['v2c-faith-money-devotional-state', 'v3a-provider-neutral-ingestion']);
   assert.equal(migrated.state.domain.devotionalState.activeDevotionalId, 'faith-money-mammon');
   assert.deepEqual(migrated.state.domain.devotionalState.entries, []);
   assert.deepEqual({

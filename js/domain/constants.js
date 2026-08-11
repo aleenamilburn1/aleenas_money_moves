@@ -1,5 +1,5 @@
 export const PRODUCT_NAME = 'Money Moves';
-export const STATE_SCHEMA_VERSION = 9;
+export const STATE_SCHEMA_VERSION = 10;
 export const DEFAULT_CURRENCY = 'USD';
 export const UNKNOWN_ACCOUNT_ID = 'unknown-account';
 
