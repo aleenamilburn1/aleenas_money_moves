@@ -12,6 +12,7 @@
 - Current domain schema: 9
 - Desktop package version: `2.0.0-desktop.0`
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
+- V3 Plaid/provider-neutral ingestion architecture is a documentation candidate only. No V3 source, backend, schema, migration, dependency, credential, or behavior has been added.
 
 ## Desktop foundation
 
@@ -151,10 +152,43 @@ adds, removes, moves, or changes a signed component. Such an upgrade requires
 an intentional linkage/policy review, updated adversarial coverage, fresh
 artifacts and notarization, and new independent acceptance.
 
+## V3 architecture candidate
+
+Read these together before scoping any V3 implementation:
+
+- `V3_PLAID_ARCHITECTURE.md` records accepted-app discovery, Hosted Link in the
+  system browser, pseudonymous device identity, minimal backend persistence,
+  cursor acknowledgement, webhooks, disconnect/reconnect, restore behavior,
+  current official Plaid references, and V3A-V3E gates.
+- `V3_CANONICAL_INGESTION_CONTRACT.md` defines offline provider-neutral account
+  and transaction mutations, source keys, exact cents/sign/currency handling,
+  field ownership, pending-to-posted identity, modifications, tombstones,
+  conflicts, idempotency, atomic apply, and V3A adversarial fixtures.
+- `V3_SECURITY_TRUST_MODEL.md` defines actor possession boundaries, renderer and
+  main separation, backend/KMS/token custody, device credential controls,
+  webhook verification, logging/redaction, support, threats, and phase gates.
+- `V3_ARCHITECTURE_DECISIONS.md` separates product-fixed rules, current
+  Plaid-imposed behavior, architecture recommendations, and four bounded
+  founder decisions.
+
+The recommendation keeps every Plaid client secret/access token/public token
+out of Electron and the vault. Backend delivers public-token completion and
+temporarily encrypted sync batches; the local vault remains the durable
+financial authority. The roadmap remains sequential: V3A follows independent
+architecture acceptance, V3B follows accepted V3A boundaries, V3C follows V3B,
+V3D depends on accepted V3A and V3C, and V3E is the private-beta hardening gate.
+
+Founder approvals required before their gates are: US/USD beta scope (V3C),
+pseudonymous device-only recovery promise (V3B), likely-duplicate Item blocking
+(V3C), and local-history retention/privacy policy review (V3E). Each register
+entry includes a recommended default; none changes the provider-neutral V3A
+contract.
+
 ## Recommended next task
 
-Complete the remaining human Finder/Dock/application-switcher icon-cache visual
-check on the release Mac. Treat any Electron/Forge package-layout change as a
-new signing-policy review. Do not begin Plaid, cloud backup, hosted sync, phone
-support, shared vaults, or travel implementation without a separately approved
-scope and acceptance plan.
+Open a separate task for independent V3 architecture acceptance. Do not begin
+V3A, V3B, Plaid, cloud backup, hosted sync, phone support, shared vaults, or
+travel implementation until that review accepts the architecture and the next
+phase receives its own bounded implementation prompt. The remaining human
+Finder/Dock/application-switcher icon-cache visual check remains a low-risk V2D
+release follow-up.
