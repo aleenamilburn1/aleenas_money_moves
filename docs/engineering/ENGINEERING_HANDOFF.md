@@ -8,7 +8,7 @@
 - Desktop foundation candidate reviewed: `v2-desktop-foundation-candidate` (`99c04ee`, `Implement desktop-first Electron foundation`)
 - Original V2D candidate rejected at acceptance phase 2: `v2d-macos-release-candidate` (`0072b61`)
 - V2D Candidate 2 rejected at acceptance phase 2: `v2d-macos-release-candidate-2` (`32347a1`, `Harden macOS release verification`)
-- V2D Candidate 3 is the verified `Restrict macOS JIT signing policy` candidate with annotated tag `v2d-macos-release-candidate-3`; independent re-acceptance remains pending
+- V2D Candidate 3 (`f912517`, `Restrict macOS JIT signing policy`) is independently accepted by `V2D_MACOS_SIGNING_NOTARIZATION_ACCEPTANCE.md`; annotated tag `v2d-macos-release-accepted` identifies the documentation-only acceptance checkpoint
 - Current domain schema: 9
 - Desktop package version: `2.0.0-desktop.0`
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
@@ -21,14 +21,14 @@ The desktop implementation is **ACCEPTED WITH LOW-RISK FOLLOW-UPS**. Read `DESKT
 - `electron/preload.cjs` exposes a frozen `moneyMovesDesktop` API only; no generic IPC, Node, filesystem, process, or Electron internals reach the renderer.
 - `js/services/desktopVaultRepository.js` keeps encryption/decryption, schema migration, domain validation, and unlocked state in the renderer.
 - `electron/localVaultRepository.js` stores only encrypted envelopes in `active.mmvault`, `previous.mmvault`, and `pending.mmvault`, with read-back verification, previous preservation, atomic promotion, permissions, and generation conflicts.
-- Electron 43.3.0 / Forge 7.11.2 produce an unsigned ARM64 macOS app, DMG, and ZIP. `inspect:package` scans filesystem/ASAR content, the empty seed, `preload.cjs`, bounded-startup modules, unsafe PNG metadata, and the multi-size canonical macOS icon.
+- Electron 43.3.0 / Forge 7.11.2 ordinary development commands produce an unsigned ARM64 macOS app, DMG, and ZIP. The independently accepted release workflow produces exact-policy Developer ID-signed, hardened-runtime, notarized artifacts. `inspect:package` scans filesystem/ASAR content, the empty seed, `preload.cjs`, bounded-startup modules, unsafe PNG metadata, and the multi-size canonical macOS icon.
 - The founder’s `/Applications` installation was confirmed to be the obsolete ESM-preload artifact (`electron/preload.js`), which explains the permanent mark-only startup screen. The current rebuild uses `electron/preload.cjs`, has a controlled fallback for any missing bridge/stalled inspection, and uses the founder-approved, self-contained `assets/brand/money-moves-mark.png` for both the UI and macOS icon. The direct bundle, DMG app, and ZIP app were verified to contain the same ICNS; Finder/Dock cache appearance still needs human confirmation.
 
 ## Product boundaries
 
 The local vault is live authority. Backup/export is manual and encrypted. Restore is explicit and conflict-protected. Existing browser users migrate only by exporting an encrypted backup and restoring it in Electron; there is no automatic localStorage/Vercel/Supabase migration or merge.
 
-Hosted live vault sync is **DEFERRED / NOT ACCEPTED**. The historical Supabase code, migrations, reports, and setup guide are retained as research but are not in the Electron runtime. Encrypted cloud backup, Plaid, phone editing, multi-device editing, shared vaults, reimbursement UI, Shared Expenses, refunds, reporting redesign, and automatic updates are not implemented. V2D Candidate 3 is fully candidate-verified in `V2D_MACOS_SIGNING_NOTARIZATION_IMPLEMENTATION.md`; independent re-acceptance remains separate.
+Hosted live vault sync is **DEFERRED / NOT ACCEPTED**. The historical Supabase code, migrations, reports, and setup guide are retained as research but are not in the Electron runtime. Encrypted cloud backup, Plaid, phone editing, multi-device editing, shared vaults, reimbursement UI, Shared Expenses, refunds, reporting redesign, and automatic updates are not implemented. V2D Candidate 3 is independently accepted in `V2D_MACOS_SIGNING_NOTARIZATION_ACCEPTANCE.md`.
 
 ## Accepted V2B desktop-beta workflows
 
@@ -69,7 +69,7 @@ Fresh automated validation passed with 198 full tests and 38 Electron-focused te
 - `python3 -m py_compile start.py`, `git diff --check`, and `CI=true pnpm run content:validate`: passed.
 - Direct and mounted-DMG native backup/restore, wrong-passphrase preservation, explicit confirmation, relaunch persistence, supported compact layout, privacy scans, and financial regression are recorded in `FAITH_AND_MONEY_DEVOTIONALS_ACCEPTANCE.md`.
 
-## V2D Candidate 3 signing-policy remediation
+## Accepted V2D Candidate 3 signing and notarization
 
 The first V2D rejection found non-structural entitlement verification and no
 cryptographic binding among build-output, DMG, and ZIP apps. Candidate 2 fixed
@@ -139,15 +139,22 @@ Validation completed:
   warning. Test-only localhost debugging was used only for disposable
   processes, and all disposable resources were removed.
 
-No product behavior, vault, schema, migration, transaction, allocation,
-devotional, UI, backup/restore, Plaid, or remote-service boundary changed. The
-founder app remained present and normal Application Support data was not
-accessed or modified. No independent V2D acceptance is claimed, and no V2D
-accepted tag may be created.
+Independent acceptance repeated the source, artifact, Apple, package,
+regression, and fresh synthetic installation gates and records the result in
+`V2D_MACOS_SIGNING_NOTARIZATION_ACCEPTANCE.md`. No product behavior, vault,
+schema, migration, transaction, allocation, devotional, UI, backup/restore,
+Plaid, or remote-service boundary changed. The founder app remained untouched
+and normal Application Support data was not accessed or modified.
+
+The exact map intentionally fails closed when a future Electron/Forge layout
+adds, removes, moves, or changes a signed component. Such an upgrade requires
+an intentional linkage/policy review, updated adversarial coverage, fresh
+artifacts and notarization, and new independent acceptance.
 
 ## Recommended next task
 
-Run independent re-acceptance against annotated tag
-`v2d-macos-release-candidate-3`. Do not create an accepted tag, and do not
-begin Plaid, cloud backup, hosted sync, phone support, shared vaults, or travel
-implementation without a separately approved scope and acceptance plan.
+Complete the remaining human Finder/Dock/application-switcher icon-cache visual
+check on the release Mac. Treat any Electron/Forge package-layout change as a
+new signing-policy review. Do not begin Plaid, cloud backup, hosted sync, phone
+support, shared vaults, or travel implementation without a separately approved
+scope and acceptance plan.

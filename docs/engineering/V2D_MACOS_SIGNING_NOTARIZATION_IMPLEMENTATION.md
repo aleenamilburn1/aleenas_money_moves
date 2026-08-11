@@ -2,16 +2,16 @@
 
 ## Status
 
-**Candidate 3 verified and ready for independent re-acceptance.** A fresh
-ARM64 app, DMG, and ZIP were built from the Candidate 3 source on 2026-08-11.
-The app and final DMG were separately accepted by Apple with zero issues,
-stapled, and validated. Exact component policy, strict codesign, hardened
-runtime, canonical candidate equality, Gatekeeper, package/security scans,
-full regression suites, and the disposable installation matrix all passed.
+**Candidate 3 independently accepted.** A fresh ARM64 app, DMG, and ZIP were
+built from the Candidate 3 source on 2026-08-11. The app and final DMG were
+separately accepted by Apple with zero issues, stapled, and validated. Exact
+component policy, strict codesign, hardened runtime, canonical candidate
+equality, Gatekeeper, package/security scans, full regression suites, and the
+disposable installation matrix all passed. Independent acceptance is recorded
+in `V2D_MACOS_SIGNING_NOTARIZATION_ACCEPTANCE.md`.
 
-This is a release-candidate result, not independent acceptance. It does not
-change product features, vault authority, migrations, financial behavior, or
-remote-service boundaries.
+The release-status change does not alter product features, vault authority,
+migrations, financial behavior, or remote-service boundaries.
 
 ## Acceptance history and root cause
 
@@ -230,6 +230,13 @@ disposable processes. The candidate app, profile, processes, and mount were
 removed afterward. `/Applications/Money Moves.app` remained present, and the
 founder's normal Application Support data was not accessed or modified.
 
+The exact signed-component map is intentionally coupled to Electron 43.3.0's
+package layout. A future Electron or Forge change that adds, removes, moves, or
+changes a signed boundary will fail closed until the new layout and linkage are
+reviewed, the explicit map and adversarial tests are intentionally updated,
+fresh artifacts receive new notarization, and the change is independently
+accepted.
+
 ## Historical Candidate 2 provenance — not valid for Candidate 3
 
 Candidate 2 previously recorded application-manifest SHA-256
@@ -241,9 +248,11 @@ and ZIP SHA-256
 Those values describe the rejected excessive-JIT artifacts and must never be
 reported as Candidate 3 provenance.
 
-## Next gate
+## Acceptance checkpoint
 
 The verified implementation is the `Restrict macOS JIT signing policy`
-candidate commit with annotated tag `v2d-macos-release-candidate-3`. Run
-independent re-acceptance against that immutable tag. Do not create a V2D
-accepted tag from this implementation task.
+candidate commit with annotated tag `v2d-macos-release-candidate-3`.
+Independent re-acceptance passed and is recorded in
+`V2D_MACOS_SIGNING_NOTARIZATION_ACCEPTANCE.md`; the annotated
+`v2d-macos-release-accepted` tag identifies its documentation-only acceptance
+checkpoint.
