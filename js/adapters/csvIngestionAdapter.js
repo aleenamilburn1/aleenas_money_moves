@@ -21,6 +21,21 @@ const DEFAULT_PROFILE = Object.freeze({
   categoryDetailedColumns:['personal_finance_category_detailed', 'category_detail', 'subcategory']
 });
 
+const CSV_ACCOUNT_ERROR_MESSAGES = Object.freeze({
+  CSV_ACCOUNT_IDENTITY_AMBIGUOUS:'A CSV account needs an explicit stable account mapping before it can be imported.',
+  CSV_ACCOUNT_MAPPING_INVALID:'The saved CSV account mapping is invalid. Correct the mapping and retry the import.',
+  SOURCE_ACCOUNT_IDENTITY_CONFLICT:'CSV rows assigned to one source account contain conflicting account facts. Assign distinct stable mappings and retry.'
+});
+
+export class CsvAccountIdentityError extends Error {
+  constructor(code, details = {}) {
+    super(CSV_ACCOUNT_ERROR_MESSAGES[code] || 'The CSV account identity could not be resolved safely.');
+    this.name = 'CsvAccountIdentityError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
 function firstValue(row, names = []) {
   for (const name of names) {
     const value = row[name];
@@ -57,13 +72,96 @@ function quarantine({ref, accountRef, observedAt, amount, currency, reason, code
   });
 }
 
-async function sourceAccountReference(row, profile) {
+function normalizedMappingLabel(value) {
+  return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+}
+
+function accountMappingIndex(accountMappings) {
+  if (accountMappings === undefined || accountMappings === null) return new Map();
+  if (typeof accountMappings !== 'object' || Array.isArray(accountMappings)) {
+    throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_must_be_an_object'});
+  }
+  const result = new Map();
+  for (const [label, reference] of Object.entries(accountMappings)) {
+    const normalizedLabel = normalizedMappingLabel(label);
+    const stableReference = typeof reference === 'string' ? reference.trim() : '';
+    if (!normalizedLabel || !stableReference) {
+      throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_entries_require_label_and_reference'});
+    }
+    if (stableReference === 'unknown-account' || stableReference.startsWith('label:')
+      || stableReference.length > 256 || /[\u0000-\u001f\u007f]/u.test(stableReference)) {
+      throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_reference_is_not_stable'});
+    }
+    const prior = result.get(normalizedLabel);
+    if (prior && prior !== stableReference) {
+      throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'normalized_mapping_labels_conflict'});
+    }
+    result.set(normalizedLabel, stableReference);
+  }
+  return result;
+}
+
+function sourceAccountReference(row, profile, mappings) {
   const external = firstValue(row, profile.accountIdColumns);
   if (external) return `external:${external}`;
   const label = firstValue(row, profile.accountColumns);
-  if (!label) return 'unknown-account';
-  if (profile.accountMappings && typeof profile.accountMappings[label] === 'string') return profile.accountMappings[label];
-  return `label:${(await sha256Text(label)).slice(0, 24)}`;
+  const mapped = mappings.get(normalizedMappingLabel(label));
+  return mapped || null;
+}
+
+function sourceAccountFacts(row, currency, profile) {
+  const accountName = firstValue(row, profile.accountColumns) || null;
+  return {
+    officialName:accountName,
+    providerDisplayName:accountName,
+    institution:{sourceInstitutionRef:null, name:firstValue(row, ['institution', 'institution_name']) || null},
+    type:accountType(firstValue(row, ['account_type', 'type'])),
+    subtype:firstValue(row, ['account_subtype', 'subtype']) || null,
+    mask:firstValue(row, ['mask', 'last_four']) || null,
+    currency,
+    sourceStatus:'active',
+    balances:null,
+    metadata:{}
+  };
+}
+
+function comparableText(value) {
+  return value === null ? null : normalizedMappingLabel(value);
+}
+
+function conflictingAccountFact(left, right, {unknown = null, normalize = comparableText} = {}) {
+  if (left === null || left === unknown || right === null || right === unknown) return false;
+  return normalize(left) !== normalize(right);
+}
+
+function accountFactsConflict(left, right) {
+  return conflictingAccountFact(left.officialName, right.officialName)
+    || conflictingAccountFact(left.providerDisplayName, right.providerDisplayName)
+    || conflictingAccountFact(left.institution.sourceInstitutionRef, right.institution.sourceInstitutionRef, {normalize:String})
+    || conflictingAccountFact(left.institution.name, right.institution.name)
+    || conflictingAccountFact(left.type, right.type, {unknown:'unknown', normalize:String})
+    || conflictingAccountFact(left.subtype, right.subtype)
+    || conflictingAccountFact(left.mask, right.mask, {normalize:String});
+}
+
+function preferKnown(current, incoming, {unknown = null} = {}) {
+  return current === null || current === unknown ? incoming : current;
+}
+
+function mergeAccountFacts(current, incoming) {
+  return {
+    ...current,
+    officialName:preferKnown(current.officialName, incoming.officialName),
+    providerDisplayName:preferKnown(current.providerDisplayName, incoming.providerDisplayName),
+    institution:{
+      sourceInstitutionRef:preferKnown(current.institution.sourceInstitutionRef, incoming.institution.sourceInstitutionRef),
+      name:preferKnown(current.institution.name, incoming.institution.name)
+    },
+    type:preferKnown(current.type, incoming.type, {unknown:'unknown'}),
+    subtype:preferKnown(current.subtype, incoming.subtype),
+    mask:preferKnown(current.mask, incoming.mask),
+    currency:preferKnown(current.currency, incoming.currency)
+  };
 }
 
 function sourceAmountInput(row, profile) {
@@ -92,6 +190,7 @@ export async function createCsvMutationBatch({
 }) {
   const profile = {...DEFAULT_PROFILE, ...profileInput};
   const parsedRows = rows || parseCsv(csvText || '');
+  const mappings = accountMappingIndex(profile.accountMappings);
   const fileDigest = await sha256Text(csvText ?? stableCanonicalJson(parsedRows));
   const profileDigest = await sha256Text(stableCanonicalJson(profile));
   const namespace = sourceNamespace || `csv:${profile.id}`;
@@ -100,34 +199,48 @@ export async function createCsvMutationBatch({
   const transactionMutations = [];
   const quarantinedRecords = [];
 
-  for (const [index, row] of parsedRows.entries()) {
-    const line = index + 2;
+  const resolvedRows = parsedRows.map((row, index) => ({
+    row,
+    line:index + 2,
+    sourceAccountRef:sourceAccountReference(row, profile, mappings)
+  }));
+  const ambiguousRows = resolvedRows.filter(item => item.sourceAccountRef === null).map(item => item.line);
+  if (ambiguousRows.length) {
+    throw new CsvAccountIdentityError('CSV_ACCOUNT_IDENTITY_AMBIGUOUS', {
+      rowNumbers:ambiguousRows.slice(0, 100),
+      rowCount:ambiguousRows.length,
+      resolution:'provide_explicit_account_id_or_saved_account_mapping'
+    });
+  }
+
+  for (const {row, line, sourceAccountRef} of resolvedRows) {
     const externalRef = firstValue(row, profile.transactionIdColumns);
     const sourceRecordRef = externalRef ? `external:${externalRef}` : `file:${fileDigest}:row:${line}`;
-    const sourceAccountRef = await sourceAccountReference(row, profile);
     const observedAt = producedAt;
     const amountInput = sourceAmountInput(row, profile);
     const currencyText = firstValue(row, profile.currencyColumns) || (profile.currencyGuaranteed ? profile.currency : '');
     const currency = normalizeCurrency(currencyText);
     const date = calendarDate(firstValue(row, profile.dateColumns));
     const description = firstValue(row, profile.descriptionColumns) || null;
-    const accountName = firstValue(row, profile.accountColumns) || null;
+    const rowAccountFacts = sourceAccountFacts(row, currency, profile);
 
     if (!accountFacts.has(sourceAccountRef)) {
       accountFacts.set(sourceAccountRef, {
-        officialName:accountName,
-        providerDisplayName:accountName,
-        institution:{sourceInstitutionRef:null, name:firstValue(row, ['institution', 'institution_name']) || null},
-        type:accountType(firstValue(row, ['account_type', 'type'])),
-        subtype:firstValue(row, ['account_subtype', 'subtype']) || null,
-        mask:firstValue(row, ['mask', 'last_four']) || null,
-        currency,
-        sourceStatus:'active',
-        balances:null,
-        metadata:{}
+        account:rowAccountFacts,
+        firstLine:line,
+        currencyConflict:false
       });
-    } else if (accountFacts.get(sourceAccountRef).currency !== currency) {
-      accountFacts.get(sourceAccountRef).currency = null;
+    } else {
+      const grouped = accountFacts.get(sourceAccountRef);
+      if (accountFactsConflict(grouped.account, rowAccountFacts)) {
+        throw new CsvAccountIdentityError('SOURCE_ACCOUNT_IDENTITY_CONFLICT', {
+          rowNumbers:[grouped.firstLine, line],
+          resolution:'provide_distinct_stable_account_mappings'
+        });
+      }
+      if (grouped.account.currency !== rowAccountFacts.currency) grouped.currencyConflict = true;
+      grouped.account = mergeAccountFacts(grouped.account, rowAccountFacts);
+      if (grouped.currencyConflict) grouped.account.currency = null;
     }
 
     if (!date) {
@@ -186,11 +299,11 @@ export async function createCsvMutationBatch({
     });
   }
 
-  const accountMutations = [...accountFacts.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([sourceAccountRef, account]) => ({
+  const accountMutations = [...accountFacts.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([sourceAccountRef, grouped]) => ({
     kind:'add',
     sourceAccountRef,
     observedAt:producedAt,
-    account:normalizedAccount(account)
+    account:normalizedAccount(grouped.account)
   }));
 
   return finishAdapterBatch({

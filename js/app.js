@@ -877,7 +877,8 @@ async function importSelectedFile(file) {
       profile:{
         signProfile:state.review.importSettings.positiveMeansSpend === false ? 'signed_cash_flow' : 'positive_outflow',
         currency:'USD',
-        currencyGuaranteed:true
+        currencyGuaranteed:true,
+        accountMappings:state.review.importSettings.accountMappings || {}
       }
     });
     const applied=await stateService.applyIngestionBatch(state,activeKey,keyMeta,batch,{expectedVaultGeneration:vaultGeneration});

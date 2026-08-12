@@ -170,7 +170,7 @@ function applyAccountAddsAndModifications(domain, batch, context, index, counts)
       sourceAudit(domain, {...context, batch, entityType:'account', entityId:account.id, action:'added', changedFields:['source'], observedAt:mutation.observedAt});
       continue;
     }
-    if (mutation.kind === 'add') {
+    if (mutation.kind === 'add' && batch.sourceKind !== 'csv') {
       if (!accountFactsEqual(existing, mutation.account)) fail('ACCOUNT_ADD_CONFLICT', 'An account add conflicts with existing source facts.');
       continue;
     }
@@ -192,6 +192,32 @@ function applyAccountAddsAndModifications(domain, batch, context, index, counts)
     Object.assign(existing, after, {sourceObservedAt:mutation.observedAt, updatedAt:context.now});
     counts.accountsUpdated += 1;
     sourceAudit(domain, {...context, batch, entityType:'account', entityId:existing.id, action:'modified', changedFields, observedAt:mutation.observedAt});
+  }
+}
+
+function assertNoUnresolvedLegacyCsvAccountIdentity(domain, batch) {
+  if (batch.sourceKind !== 'csv') return;
+  const legacyReference = value => typeof value === 'string' && value.startsWith('label:');
+  const persistedCollections = [
+    domain?.accounts,
+    domain?.transactions,
+    domain?.sourceQuarantines,
+    domain?.sourceTombstones
+  ];
+  const unresolvedPersisted = persistedCollections.some(collection => Array.isArray(collection)
+    && collection.some(item => item.sourceKind === 'csv'
+      && item.sourceNamespace === batch.sourceNamespace
+      && legacyReference(item.sourceAccountRef)));
+  const unresolvedIncoming = [
+    ...batch.accountMutations,
+    ...batch.transactionMutations,
+    ...batch.quarantinedRecords
+  ].some(item => legacyReference(item.sourceAccountRef));
+  if (unresolvedPersisted || unresolvedIncoming) {
+    fail(
+      'CSV_LEGACY_ACCOUNT_IDENTITY_UNRESOLVED',
+      'This CSV import profile has unresolved account identity from an unreleased ingestion candidate. Use controlled account remediation before retrying.'
+    );
   }
 }
 
@@ -906,6 +932,7 @@ async function assertRejectedCandidateCsvReplay(state, receipt, batch) {
 export async function reconcileMutationBatch(state, batch, {idFactory = defaultIdFactory, now = batch?.producedAt} = {}) {
   if (state?.schemaVersion !== STATE_SCHEMA_VERSION) fail('UNSUPPORTED_SCHEMA', `Ingestion requires vault schema ${STATE_SCHEMA_VERSION}.`);
   await validateSourceMutationBatch(batch);
+  assertNoUnresolvedLegacyCsvAccountIdentity(state.domain, batch);
   const priorReceipt = state.domain?.ingestionReceipts?.find(item => item.batchId === batch.batchId);
   if (priorReceipt) {
     if (priorReceipt.payloadDigest === batch.payloadDigest) {

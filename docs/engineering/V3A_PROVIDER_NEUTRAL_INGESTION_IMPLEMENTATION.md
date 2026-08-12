@@ -1,12 +1,13 @@
 # Money Moves V3A — Provider-Neutral Ingestion Implementation
 
-Date: 2026-08-11
-Status: CANDIDATES 1 AND 2 REJECTED; LEGACY-RECEIPT REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
+Date: 2026-08-12
+Status: CANDIDATES 1–3 REJECTED; CSV ACCOUNT-IDENTITY REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
 Domain schema: 10
 Trusted parent: `5d2c44925931292724bc4a2d62cfade3c969f606` (`v3-plaid-architecture-accepted`)
 Rejected Candidate 1: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
 Rejected Candidate 2: `c2adfaca8411b2bdc9a050097452021e79928fcb` (`v3a-provider-neutral-ingestion-candidate-2`)
-Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-3`
+Rejected Candidate 3: `dce5bb2c812fef1332e3c81153f93a68de0a6871` (`v3a-provider-neutral-ingestion-candidate-3`)
+Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-4`
 
 ## Outcome and scope
 
@@ -23,7 +24,7 @@ requests, foreign-exchange conversion, a Reports UI, or V3B/V3C/V3D/V3R/V3E
 behavior. The fixture adapter is test-only source behavior implemented without
 network access. V3A is not accepted by this implementation report.
 
-## Candidate 1 and Candidate 2 rejections
+## Candidate 1 through Candidate 3 rejections
 
 Independent acceptance rejected Candidate 1 after reproducing four blockers:
 
@@ -51,6 +52,21 @@ architecture or add V3B, live Plaid, backend/network behavior, Hosted Link,
 cursor/webhook code, FX, or a Reports UI. Independent re-acceptance is still
 required in a separate review.
 
+Independent acceptance rejected Candidate 3 after reproducing a sixth blocker.
+When a CSV row omitted `account_id`, the adapter hashed only its display label.
+`Bank A / Checking / 1111` and `Bank B / Checking / 2222` therefore produced
+one account mutation, one label-derived source-account reference, first-row
+Bank A metadata, and two transactions attached to the same canonical account.
+This violated the accepted prohibition on treating institution, account name,
+or mask as sufficient identity.
+
+Candidate 4 removes the label-derived fallback, makes the source-account
+resolution hierarchy explicit, rejects ambiguous account rows before returning
+a mutation batch, detects grouped-fact conflicts instead of keeping the first
+row, passes saved mappings from the existing import settings, and refuses to
+reinterpret persisted unreleased `label:` identities. It does not add an import
+mapping UI or broaden V3A scope.
+
 ## Requirements affected
 
 The implementation follows the PRD's provider-metadata, traceability,
@@ -67,6 +83,10 @@ principles. It implements or strengthens the data/service foundations for:
   incompatible source correction snapshots and supersedes them for resolution.
 - `ACT-001`–`ACT-003`: stable local accounts are separate from source account
   references, and source changes do not replace friendly names or visibility.
+- `SET-003`: an existing saved CSV account mapping may provide stable account
+  identity; mapping labels normalize only case, Unicode form, and whitespace.
+- `IMP-001`: rows lacking both an explicit account ID and a saved mapping fail
+  with a bounded, actionable typed error before commit.
 - `LOC-001`–`LOC-002`: unknown location remains explicit and ordinary canonical
   fields retain only region, country, and provenance.
 - `IMP-002`: identical replay is accepted only when receipt identity and
@@ -102,6 +122,12 @@ deterministic provider-neutral source identities. Records without a trustworthy
 external reference reuse their stable local ID; the migration does not invent a
 provider connection, account mask, location, merchant, or reimbursement.
 
+The schema-9→10 migration never uses account display metadata as identity. A
+unique legacy external account ID remains authoritative; otherwise the stable
+local Money Moves account ID becomes `account:<local-id>`. Two schema-9 CSV
+accounts named `Checking` therefore remain distinct even when both lack an
+external ID. This path is covered directly by migration tests.
+
 ## Identity model
 
 Local ownership and source identity are distinct:
@@ -121,6 +147,44 @@ source keys differ.
 Semantic similarity—date, amount, merchant, description, or category—is never
 used as an identity or automatic pending match. Pending aliases remain indexed
 to the same local transaction after a valid posted replacement.
+
+### CSV source-account resolution hierarchy
+
+CSV account identity is resolved once per row in this order:
+
+1. A non-empty native `account_id` (or configured account-ID column) becomes
+   `external:<source-value>`.
+2. Otherwise, a saved import-profile `accountMappings` entry may provide an
+   explicit stable source-account reference. Mapping labels receive only NFKC,
+   trim, repeated-whitespace, and case normalization. The mapping value—not the
+   descriptive label—is identity. `unknown-account`, legacy `label:` refs,
+   controls, empty refs, and oversized refs are invalid mappings.
+3. There is no metadata-derived fallback. A row without either source returns
+   typed `CSV_ACCOUNT_IDENTITY_AMBIGUOUS`, with bounded row numbers and a future
+   remediation action but no account label, institution, mask, or financial
+   payload.
+
+Rows resolving to one explicit ref are grouped only when their known account
+facts are compatible. Conflicting institution/name/mask/type/subtype facts
+return typed `SOURCE_ACCOUNT_IDENTITY_CONFLICT`; unknown facts may become known,
+and mixed currency remains explicit account uncertainty while the affected
+transaction row follows ordinary quarantine rules. No first-row-wins merge is
+permitted across conflicting account evidence.
+
+Identity and metadata classifications are:
+
+- **Authoritative source identity:** explicit source `account_id`; explicit
+  saved mapping value; source kind; source namespace; and, for migration only,
+  an already-stable local account ID when no unique external ID exists.
+- **Import-profile identity:** `profile.id` establishes the CSV namespace and
+  `accountMappings` stores explicit label-to-stable-ref decisions. The label is
+  a selector inside that saved decision, not global account identity.
+- **Source account metadata:** official/display label, institution text and
+  source institution ref, mask, type, subtype, currency, balances, source
+  status, and source metadata. These may update only after stable identity is
+  established and never perform fuzzy linkage.
+- **User-editable metadata:** friendly name plus enabled/hidden choices. Source
+  refreshes and corrected CSV metadata never overwrite these fields.
 
 ## Closed mutation-batch contract
 
@@ -200,6 +264,13 @@ metadata. They cannot set or overwrite friendly account names, enabled/hidden
 choices, movement type, review status, notes, manual overrides, bucket
 allocations, claim relationships, or other user-owned meaning.
 
+For CSV, a later account observation with the same explicit or mapped source
+identity updates source-owned metadata and appends an account audit event even
+though CSV account observations use the contract's `add` shape. The local
+account ID and user-owned fields remain stable. Formatting-only display changes
+cannot change a mapped identity. A changed mapping value is an explicit profile
+identity decision, not fuzzy matching.
+
 New imported transactions begin `unclassified` and `pending` review regardless
 of provider category metadata. Category data is preserved only as secondary
 reference metadata. Automation does not silently review a transaction.
@@ -261,6 +332,14 @@ mutually exclusive debit/credit columns. A supplied external transaction ID is
 used with account scope; otherwise the accepted file-digest/row-ordinal fallback
 also participates in the account-scoped canonical source key.
 
+The CSV adapter does not derive account identity from label, institution, mask,
+type, subtype, amount, date, merchant, transaction similarity, or observation
+time. Same-label accounts across institutions, within one institution, or with
+equal masks fail closed unless the file supplies distinct stable IDs. A saved
+label mapping can identify one otherwise unambiguous account; if multiple rows
+assigned to that mapping carry conflicting account facts, the complete adapter
+operation fails before a batch exists.
+
 The existing CSV button now submits the canonical batch through StateService.
 Its legacy review-card projection remains a compatibility view, not an
 independent financial source of truth. The older CSV helper no longer uses
@@ -308,9 +387,15 @@ Candidate 3 changes only `js/domain/models.js`,
 and these three engineering documents. It adds no migration, dependency, UI,
 adapter, backend, or storage-format change.
 
+Candidate 4 changes only `js/adapters/csvIngestionAdapter.js`, `js/app.js`,
+`js/services/ingestionService.js`, `test/provider-neutral-ingestion.test.js`,
+and these three engineering documents. It adds no schema migration, dependency,
+backend, network path, credential, provider product, FX behavior, Reports UI,
+or build artifact.
+
 ## Tests and fixtures
 
-The 72 focused V3A checks use only synthetic manual, CSV, and fixture-provider
+The 91 focused V3A checks use only synthetic manual, CSV, and fixture-provider
 values.
 They cover exact cents and sign matrices; malformed, huge, zero, missing,
 invalid, and foreign-currency values; closed contract limits; account and
@@ -331,22 +416,41 @@ missing one row from a multi-row batch, missing/extra audit evidence, missing
 quarantine evidence, an effect-less empty batch, later legitimate source
 modification, later tombstoning, and retained quarantine replay.
 
-Full remediation validation records 303 unit tests and 38 Electron-focused tests,
+Candidate 4 adds explicit-ID stability, normalized saved mappings, invalid
+mapping rejection, all five same-label/mask/institution ambiguity cases,
+grouped-fact conflicts, direct account mutation and transaction-assignment
+assertions, source-metadata updates under stable identity, account-scoped equal
+external transaction IDs, file-digest/row fallback replay, multi-account atomic
+failure plus mapped retry, unreleased schema-10 `label:` refusal, schema-9
+duplicate-label migration, encrypted restore/reimport, and corrected-identity
+Candidate-1 receipt proof.
+
+Full remediation validation records 322 unit tests and 38 Electron-focused tests,
 all passing with zero failures, skips, or todos. No dependency was added.
 
 ## Schema decision
 
-The schema remains 10. Candidate 3 changes validation and compatibility behavior,
-not persisted entity shape. Schema 10 already retains the deterministic evidence
-needed for the supported proof: source kind/namespace/account/reference,
-source-account facts, transaction source history, quarantine/tombstone/conflict
-records, and batch-scoped source audit events. Later transaction modification or
-removal does not erase the original facts. If schema-10 state cannot prove an
-edge case—for example, an empty Candidate-1 batch or source-account facts that
-were later changed without account history—the legacy replay fails closed and
-requires explicit integrity handling. Candidate 1 and Candidate 2 were never
-accepted or released, so schema 11 or a corrective migration would add risk
-without improving the supported proof.
+The schema remains 10. Candidate 4 changes adapter resolution and reconciliation
+policy, not persisted entity shape. Schema 9→10 identity generation is already
+safe: it uses a unique external reference or a stable local account ID, never a
+display label.
+
+Candidates 1–3 could nevertheless have written unreleased schema-10 vaults with
+unsafe `label:` source-account refs. Those refs may be present on accounts,
+transactions, quarantines, tombstones, receipt digests, and related audit or
+conflict history. Two real accounts may already have been collapsed, so no
+deterministic migration can recover the lost boundary. Candidate 4 therefore
+does not rewrite or split those refs and does not advance to schema 11. Any CSV
+batch or same-namespace persisted evidence containing a `label:` ref returns
+`CSV_LEGACY_ACCOUNT_IDENTITY_UNRESOLVED` before replay or mutation. Candidates
+1–3 were never accepted or released; explicit controlled remediation of any
+internal candidate vault is safer than silently guessing account boundaries.
+
+Candidate 3's legacy receipt proof remains unchanged for explicit or corrected
+mapped identities. Malformed, missing-effect, wrong-account, wrong-reference,
+unrelated-batch, partial, contradictory, and changed-payload cases still fail
+closed; active, later-modified, tombstoned, and quarantined evidence remains
+provable.
 
 ## Security and scope review
 
@@ -358,8 +462,13 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Known limitations
 
-- Candidates 1 and 2 were rejected; Candidate 3 awaits independent
-  re-acceptance.
+- Candidates 1–3 were rejected; Candidate 4 awaits independent re-acceptance.
+- There is no dedicated account-mapping UI in V3A. CSVs without stable account
+  IDs require an existing saved mapping; same-label distinct accounts require
+  distinct source IDs or a future richer explicit mapping workflow.
+- Unreleased schema-10 `label:` histories cannot be repaired automatically and
+  intentionally block same-namespace CSV ingestion pending controlled
+  remediation.
 - A structurally valid Candidate-1 receipt is insufficient by itself. Legacy
   replay fails closed when schema-10 state cannot independently prove its
   effects, including genuinely empty legacy batches and account-source changes
@@ -377,8 +486,8 @@ interpretation continue to persist only through the existing encrypted vault.
 ## Recommended next task
 
 Run an independent V3A re-acceptance review from
-`v3a-provider-neutral-ingestion-candidate-3`. Re-read the
+`v3a-provider-neutral-ingestion-candidate-4`. Re-read the
 five authoritative V3 documents, audit schema-9 migration and field ownership,
-repeat the 303-unit/38-Electron validation gate, add adversarial cases if any
+repeat the 322-unit/38-Electron validation gate, add adversarial cases if any
 gap is found, and issue a separate acceptance or rejection record. Do not begin
 V3B from this implementation report alone.

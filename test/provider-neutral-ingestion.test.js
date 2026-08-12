@@ -687,7 +687,11 @@ test('CSV adapter uses exact source identities and explicit sign profiles withou
     '2026-08-01,Coffee,5.25,Checking,tx-b,TRANSFERS,USD',
     '2026-08-02,Travel,10.00,Checking,tx-eur,TRAVEL,EUR'
   ].join('\n');
-  const batch = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile:{signProfile:'positive_outflow'}});
+  const batch = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:V3A_NOW,
+    profile:{signProfile:'positive_outflow', accountMappings:{Checking:'mapped:checking'}}
+  });
   assert.deepEqual(batch.transactionMutations.map(item => item.record.amountCents), [-525, -525]);
   assert.notEqual(batch.transactionMutations[0].sourceRecordRef, batch.transactionMutations[1].sourceRecordRef);
   assert.equal(batch.quarantinedRecords[0].sourceCurrency, 'EUR');
@@ -695,6 +699,412 @@ test('CSV adapter uses exact source identities and explicit sign profiles withou
   assert.equal(result.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 2);
   assert.equal(result.state.domain.transactions.filter(item => item.sourceKind === 'csv').every(item => item.movementType === 'unclassified'), true);
   assert.equal((await reconcileMutationBatch(result.state, batch, {idFactory:ids()})).result.status, 'already_applied');
+});
+
+test('CSV account identity fails closed instead of merging same-label accounts without stable IDs', async () => {
+  const csv = [
+    'date,description,amount,account,institution,mask,transaction_id,currency',
+    '2026-08-01,Bank A purchase,5.25,Checking,Bank A,1111,tx-a,USD',
+    '2026-08-02,Bank B purchase,7.50,Checking,Bank B,2222,tx-b,USD'
+  ].join('\n');
+
+  await assert.rejects(
+    () => createCsvMutationBatch({
+      csvText:csv,
+      producedAt:V3A_NOW,
+      profile:{id:'same-label-rejection-profile', signProfile:'positive_outflow'}
+    }),
+    error => error.code === 'CSV_ACCOUNT_IDENTITY_AMBIGUOUS'
+  );
+});
+
+test('CSV account resolution hierarchy preserves explicit IDs and normalized saved mappings', async t => {
+  await t.test('explicit account IDs keep same-label accounts distinct with exact assignments', async () => {
+    const csv = [
+      'date,description,amount,account_id,account,institution,mask,account_type,account_subtype,transaction_id,currency',
+      '2026-08-01,Bank A purchase,5.25,bank-a-checking,Checking,Bank A,1111,depository,checking,shared-id,USD',
+      '2026-08-02,Bank B purchase,7.50,bank-b-checking,Checking,Bank B,2222,depository,checking,shared-id,USD'
+    ].join('\n');
+    const batch = await createCsvMutationBatch({
+      csvText:csv,
+      producedAt:V3A_NOW,
+      profile:{id:'explicit-account-id-profile', signProfile:'positive_outflow'}
+    });
+    assert.equal(batch.accountMutations.length, 2);
+    assert.deepEqual(
+      batch.accountMutations.map(item => item.sourceAccountRef).sort(),
+      ['external:bank-a-checking', 'external:bank-b-checking']
+    );
+    assert.notEqual(batch.transactionMutations[0].sourceAccountRef, batch.transactionMutations[1].sourceAccountRef);
+
+    const applied = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+    const accounts = applied.state.domain.accounts.filter(item => item.sourceKind === 'csv');
+    const transactions = applied.state.domain.transactions.filter(item => item.sourceKind === 'csv');
+    assert.equal(accounts.length, 2);
+    assert.equal(transactions.length, 2);
+    for (const expected of [
+      {ref:'external:bank-a-checking', institution:'Bank A', mask:'1111'},
+      {ref:'external:bank-b-checking', institution:'Bank B', mask:'2222'}
+    ]) {
+      const account = accounts.find(item => item.sourceAccountRef === expected.ref);
+      const transaction = transactions.find(item => item.sourceAccountRef === expected.ref);
+      assert.equal(account.institutionName, expected.institution);
+      assert.equal(account.mask, expected.mask);
+      assert.equal(account.type, 'depository');
+      assert.equal(account.subtype, 'checking');
+      assert.equal(transaction.accountId, account.id);
+    }
+  });
+
+  await t.test('saved mapping labels normalize case and whitespace without changing account identity', async () => {
+    const profile = {
+      id:'normalized-account-mapping-profile',
+      signProfile:'positive_outflow',
+      accountMappings:{' Checking ':'mapped:bank-a-checking'}
+    };
+    const firstCsv = [
+      'date,description,amount,account,institution,mask,transaction_id,currency',
+      '2026-08-01,Coffee,5.25,Checking,Bank A,1111,stable-transaction,USD'
+    ].join('\n');
+    const secondCsv = firstCsv.replace(',Checking,', ',CHECKING,');
+    const firstBatch = await createCsvMutationBatch({csvText:firstCsv, producedAt:V3A_NOW, profile});
+    const secondBatch = await createCsvMutationBatch({
+      csvText:secondCsv,
+      producedAt:'2026-08-12T16:00:00.000Z',
+      profile
+    });
+    assert.equal(firstBatch.accountMutations[0].sourceAccountRef, 'mapped:bank-a-checking');
+    assert.equal(secondBatch.accountMutations[0].sourceAccountRef, 'mapped:bank-a-checking');
+    const first = await reconcileMutationBatch(freshState(), firstBatch, {idFactory:ids(), now:V3A_NOW});
+    const originalAccount = first.state.domain.accounts.find(item => item.sourceKind === 'csv');
+    const originalTransaction = first.state.domain.transactions.find(item => item.sourceKind === 'csv');
+    const replay = await reconcileMutationBatch(first.state, secondBatch, {
+      idFactory:ids(), now:'2026-08-12T16:00:00.000Z'
+    });
+    const account = replay.state.domain.accounts.find(item => item.sourceKind === 'csv');
+    const transaction = replay.state.domain.transactions.find(item => item.sourceKind === 'csv');
+    assert.equal(account.id, originalAccount.id);
+    assert.equal(transaction.id, originalTransaction.id);
+    assert.equal(transaction.accountId, account.id);
+    assert.equal(replay.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 1);
+    assert.equal(replay.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 1);
+  });
+
+  await t.test('explicit stable identity accepts source metadata updates without replacing user account fields', async () => {
+    const profile = {id:'explicit-metadata-update-profile', signProfile:'positive_outflow'};
+    const firstCsv = [
+      'date,description,amount,account_id,account,institution,mask,account_type,account_subtype,transaction_id,currency',
+      '2026-08-01,Coffee,5.25,stable-account,Checking,Bank A,,depository,,stable-meta-tx,USD'
+    ].join('\n');
+    const secondCsv = [
+      'date,description,amount,account_id,account,institution,mask,account_type,account_subtype,transaction_id,currency',
+      '2026-08-01,Coffee,5.25,stable-account,CHECKING,Bank A Corrected,9999,depository,cash management,stable-meta-tx,USD'
+    ].join('\n');
+    const firstBatch = await createCsvMutationBatch({csvText:firstCsv, producedAt:V3A_NOW, profile});
+    const first = await reconcileMutationBatch(freshState(), firstBatch, {idFactory:ids(), now:V3A_NOW});
+    const firstAccount = first.state.domain.accounts.find(item => item.sourceKind === 'csv');
+    firstAccount.friendlyName = 'My Primary Account';
+    firstAccount.enabled = false;
+    firstAccount.hidden = true;
+    const secondBatch = await createCsvMutationBatch({
+      csvText:secondCsv,
+      producedAt:'2026-08-12T16:00:00.000Z',
+      profile
+    });
+    const second = await reconcileMutationBatch(first.state, secondBatch, {
+      idFactory:ids(), now:'2026-08-12T16:00:00.000Z'
+    });
+    const updated = second.state.domain.accounts.find(item => item.sourceKind === 'csv');
+    assert.equal(updated.id, firstAccount.id);
+    assert.equal(updated.sourceAccountRef, 'external:stable-account');
+    assert.equal(updated.friendlyName, 'My Primary Account');
+    assert.equal(updated.enabled, false);
+    assert.equal(updated.hidden, true);
+    assert.equal(updated.officialName, 'CHECKING');
+    assert.equal(updated.institutionName, 'Bank A Corrected');
+    assert.equal(updated.mask, '9999');
+    assert.equal(updated.subtype, 'cash management');
+    assert.equal(second.result.counts.accountsUpdated, 1);
+    assert.equal(second.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 1);
+  });
+
+  await t.test('saved mappings reject Unknown-account and legacy label references as stable identity', async () => {
+    const csv = [
+      'date,description,amount,account,transaction_id,currency',
+      '2026-08-01,Coffee,5.25,Checking,invalid-map-tx,USD'
+    ].join('\n');
+    for (const sourceAccountRef of ['unknown-account', 'label:unsafe']) {
+      await assert.rejects(
+        () => createCsvMutationBatch({
+          csvText:csv,
+          producedAt:V3A_NOW,
+          profile:{
+            id:`invalid-mapping-${sourceAccountRef}`,
+            signProfile:'positive_outflow',
+            accountMappings:{Checking:sourceAccountRef}
+          }
+        }),
+        error => error.code === 'CSV_ACCOUNT_MAPPING_INVALID'
+      );
+    }
+  });
+});
+
+test('ambiguous missing-ID CSV account descriptors fail closed across adversarial collisions', async t => {
+  const cases = [
+    {
+      name:'same label, different institution and mask',
+      rows:['Bank A,Checking,1111', 'Bank B,Checking,2222']
+    },
+    {
+      name:'same institution and label, different mask',
+      rows:['Bank A,Checking,1111', 'Bank A,Checking,2222']
+    },
+    {
+      name:'same label and mask, different institution',
+      rows:['Bank A,Checking,1111', 'Bank B,Checking,1111']
+    },
+    {
+      name:'same institution and label, one missing mask',
+      rows:['Bank A,Checking,1111', 'Bank A,Checking,']
+    },
+    {
+      name:'indistinguishable descriptors without a stable mapping',
+      rows:['Bank A,Checking,1111', 'Bank A,Checking,1111']
+    }
+  ];
+  for (const item of cases) await t.test(item.name, async () => {
+    const csv = [
+      'date,description,amount,institution,account,mask,transaction_id,currency',
+      `2026-08-01,First,5.25,${item.rows[0]},tx-a,USD`,
+      `2026-08-02,Second,7.50,${item.rows[1]},tx-b,USD`
+    ].join('\n');
+    await assert.rejects(
+      () => createCsvMutationBatch({
+        csvText:csv,
+        producedAt:V3A_NOW,
+        profile:{id:`ambiguous-${item.name}`, signProfile:'positive_outflow'}
+      }),
+      error => {
+        assert.equal(error.code, 'CSV_ACCOUNT_IDENTITY_AMBIGUOUS');
+        assert.equal(error.details.rowCount, 2);
+        assert.deepEqual(error.details.rowNumbers, [2, 3]);
+        assert.doesNotMatch(JSON.stringify(error.details), /Bank A|Bank B|1111|2222|Checking/);
+        return true;
+      }
+    );
+  });
+});
+
+test('CSV grouping rejects conflicting facts assigned to one mapping instead of choosing the first row', async () => {
+  const csv = [
+    'date,description,amount,institution,account,mask,transaction_id,currency',
+    '2026-08-01,First,5.25,Bank A,Checking,1111,tx-a,USD',
+    '2026-08-02,Second,7.50,Bank B,Savings,2222,tx-b,USD'
+  ].join('\n');
+  await assert.rejects(
+    () => createCsvMutationBatch({
+      csvText:csv,
+      producedAt:V3A_NOW,
+      profile:{
+        id:'conflicting-group-profile',
+        signProfile:'positive_outflow',
+        accountMappings:{Checking:'mapped:one-account', Savings:'mapped:one-account'}
+      }
+    }),
+    error => {
+      assert.equal(error.code, 'SOURCE_ACCOUNT_IDENTITY_CONFLICT');
+      assert.deepEqual(error.details.rowNumbers, [2, 3]);
+      assert.doesNotMatch(JSON.stringify(error.details), /Bank A|Bank B|1111|2222|Checking|Savings/);
+      return true;
+    }
+  );
+});
+
+test('mapped distinct accounts retain account-scoped transaction identity including fallback record refs', async () => {
+  const sharedExternalIdCsv = [
+    'date,description,amount,account,transaction_id,currency',
+    '2026-08-01,Checking purchase,5.25,Checking,shared-external-id,USD',
+    '2026-08-02,Savings purchase,7.50,Savings,shared-external-id,USD'
+  ].join('\n');
+  const profile = {
+    id:'mapped-transaction-scope-profile',
+    signProfile:'positive_outflow',
+    accountMappings:{Checking:'mapped:checking', Savings:'mapped:savings'}
+  };
+  const externalBatch = await createCsvMutationBatch({csvText:sharedExternalIdCsv, producedAt:V3A_NOW, profile});
+  assert.equal(externalBatch.transactionMutations[0].sourceRecordRef, externalBatch.transactionMutations[1].sourceRecordRef);
+  assert.notEqual(externalBatch.transactionMutations[0].sourceAccountRef, externalBatch.transactionMutations[1].sourceAccountRef);
+  const applied = await reconcileMutationBatch(freshState(), externalBatch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(applied.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 2);
+  assert.equal(applied.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 2);
+
+  const noExternalIdCsv = [
+    'date,description,amount,account,currency',
+    '2026-08-03,Fallback identity,9.25,Checking,USD'
+  ].join('\n');
+  const firstFallback = await createCsvMutationBatch({csvText:noExternalIdCsv, producedAt:V3A_NOW, profile});
+  const laterFallback = await createCsvMutationBatch({
+    csvText:noExternalIdCsv,
+    producedAt:'2026-08-12T16:00:00.000Z',
+    profile
+  });
+  assert.match(firstFallback.transactionMutations[0].sourceRecordRef, /^file:[a-f0-9]{64}:row:2$/);
+  assert.equal(firstFallback.transactionMutations[0].sourceRecordRef, laterFallback.transactionMutations[0].sourceRecordRef);
+  assert.equal(firstFallback.payloadDigest, laterFallback.payloadDigest);
+  const fallbackApplied = await reconcileMutationBatch(applied.state, firstFallback, {idFactory:ids(), now:V3A_NOW});
+  const fallbackReplay = await reconcileMutationBatch(fallbackApplied.state, laterFallback, {
+    idFactory:ids(), now:'2026-08-12T16:00:00.000Z'
+  });
+  assert.equal(fallbackReplay.result.status, 'already_applied');
+  assert.equal(fallbackReplay.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 3);
+});
+
+test('ambiguous multi-account CSV leaves the encrypted vault unchanged and succeeds after explicit mapping', async () => {
+  const csv = [
+    'date,description,amount,account_id,account,transaction_id,currency',
+    '2026-08-01,Explicit row,5.25,explicit-checking,Checking,tx-explicit,USD',
+    '2026-08-02,Needs mapping,7.50,,Savings,tx-mapped,USD'
+  ].join('\n');
+  const state = freshState();
+  const repository = createVaultRepository();
+  const service = createStateService({repository, seed:freshState()});
+  const created = await service.create('correct horse battery staple', state);
+  const beforeState = structuredClone(created.state);
+  const beforeBackup = await service.exportEncryptedBackup();
+
+  await assert.rejects(
+    () => createCsvMutationBatch({
+      csvText:csv,
+      producedAt:V3A_NOW,
+      profile:{id:'atomic-account-mapping-profile', signProfile:'positive_outflow'}
+    }),
+    error => error.code === 'CSV_ACCOUNT_IDENTITY_AMBIGUOUS'
+  );
+  assert.deepEqual(created.state, beforeState);
+  assert.equal(await service.exportEncryptedBackup(), beforeBackup);
+
+  const corrected = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:'2026-08-12T16:00:00.000Z',
+    profile:{
+      id:'atomic-account-mapping-profile',
+      signProfile:'positive_outflow',
+      accountMappings:{Savings:'mapped:savings'}
+    }
+  });
+  const applied = await service.applyIngestionBatch(created.state, created.key, created.meta, corrected, {
+    expectedVaultGeneration:created.vaultGeneration,
+    idFactory:ids(),
+    now:'2026-08-12T16:00:00.000Z'
+  });
+  assert.equal(applied.result.counts.accountsAdded, 2);
+  assert.equal(applied.result.counts.transactionsAdded, 2);
+  assert.equal(applied.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 2);
+  assert.equal(applied.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 2);
+});
+
+test('unreleased schema-10 label identities require remediation without reinterpretation', async () => {
+  const csv = [
+    'date,description,amount,account,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,Checking,legacy-label-tx,USD'
+  ].join('\n');
+  const profile = {
+    id:'legacy-label-state-profile',
+    signProfile:'positive_outflow',
+    accountMappings:{Checking:'mapped:checking'}
+  };
+  const batch = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  const applied = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  const legacyRef = 'label:0dfe1d63c9d868967e5de877';
+  const account = applied.state.domain.accounts.find(item => item.sourceKind === 'csv');
+  const transaction = applied.state.domain.transactions.find(item => item.sourceKind === 'csv');
+  account.sourceAccountRef = legacyRef;
+  account.externalAccountId = legacyRef;
+  transaction.sourceAccountRef = legacyRef;
+  assert.equal(validateDomainStore(applied.state.domain).ok, true);
+  const before = structuredClone(applied.state);
+  const corrected = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:'2026-08-12T16:00:00.000Z',
+    profile
+  });
+  await assert.rejects(
+    () => reconcileMutationBatch(applied.state, corrected, {idFactory:ids(), now:'2026-08-12T16:00:00.000Z'}),
+    error => error.code === 'CSV_LEGACY_ACCOUNT_IDENTITY_UNRESOLVED'
+  );
+  assert.deepEqual(applied.state, before);
+});
+
+test('encrypted backup restore preserves mapped account identity and stable CSV reimport', async () => {
+  const csv = [
+    'date,description,amount,account,institution,mask,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,Checking,Bank A,1111,backup-stable-tx,USD'
+  ].join('\n');
+  const profile = {
+    id:'backup-account-mapping-profile',
+    signProfile:'positive_outflow',
+    accountMappings:{Checking:'mapped:bank-a-checking'}
+  };
+  const batch = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile});
+  const imported = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  imported.state.review.importSettings.accountMappings = structuredClone(profile.accountMappings);
+  const repository = createVaultRepository();
+  const service = createStateService({repository, seed:freshState()});
+  const passphrase = 'correct horse battery staple';
+  const created = await service.create(passphrase, imported.state);
+  const backup = await service.exportEncryptedBackup();
+  const changed = structuredClone(created.state);
+  changed.preferences.monthlyIncome = 123;
+  const saved = await service.save(changed, created.key, created.meta, {
+    expectedVaultGeneration:created.vaultGeneration
+  });
+  const restored = await service.restore(backup, passphrase, {expectedVaultGeneration:saved.vaultGeneration});
+  const restoredAccount = restored.state.domain.accounts.find(item => item.sourceKind === 'csv');
+  const restoredTransaction = restored.state.domain.transactions.find(item => item.sourceKind === 'csv');
+  assert.equal(restoredAccount.sourceAccountRef, 'mapped:bank-a-checking');
+  assert.equal(restoredAccount.institutionName, 'Bank A');
+  assert.equal(restoredAccount.mask, '1111');
+  assert.equal(restoredTransaction.sourceAccountRef, restoredAccount.sourceAccountRef);
+  assert.equal(restoredTransaction.accountId, restoredAccount.id);
+  assert.deepEqual(restored.state.review.importSettings.accountMappings, profile.accountMappings);
+
+  const later = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:'2026-08-13T16:00:00.000Z',
+    profile
+  });
+  const replay = await reconcileMutationBatch(restored.state, later, {
+    idFactory:ids(), now:'2026-08-13T16:00:00.000Z'
+  });
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 1);
+  assert.equal(replay.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 1);
+});
+
+test('Candidate 1 legacy receipt proof remains valid with corrected mapped account identity', async () => {
+  const csv = [
+    'date,description,amount,account,transaction_id,currency',
+    '2026-08-01,Coffee,5.25,Checking,mapped-legacy-receipt,USD'
+  ].join('\n');
+  const profile = {
+    id:'mapped-legacy-receipt-profile',
+    signProfile:'positive_outflow',
+    accountMappings:{Checking:'mapped:legacy-checking'}
+  };
+  const original = await appliedCandidate1Csv({csv, profile});
+  assert.equal(original.original.accountMutations[0].sourceAccountRef, 'mapped:legacy-checking');
+  const replayBatch = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:'2026-08-12T16:00:00.000Z',
+    profile
+  });
+  const replay = await reconcileMutationBatch(original.state, replayBatch, {
+    idFactory:ids(), now:'2026-08-12T16:00:00.000Z'
+  });
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.changed, false);
+  assert.equal(replay.state.domain.transactions.find(item => item.sourceKind === 'csv').sourceAccountRef, 'mapped:legacy-checking');
 });
 
 test('identical CSV content and profile replay across production times without a batch collision', async () => {
@@ -1131,7 +1541,11 @@ test('CSV debit/credit columns map exactly and require one explicit non-empty si
     '2026-08-02,Credit row,,8.90,Checking,credit-row,USD',
     '2026-08-03,Ambiguous row,1.00,1.00,Checking,bad-row,USD'
   ].join('\n');
-  const batch = await createCsvMutationBatch({csvText:csv, producedAt:V3A_NOW, profile:{signProfile:'debit_credit'}});
+  const batch = await createCsvMutationBatch({
+    csvText:csv,
+    producedAt:V3A_NOW,
+    profile:{signProfile:'debit_credit', accountMappings:{Checking:'mapped:checking'}}
+  });
   assert.deepEqual(batch.transactionMutations.map(item => item.record.amountCents), [-1234, 890]);
   assert.deepEqual(batch.transactionMutations.map(item => item.record.sourceAmount.signConvention), ['debit_credit', 'debit_credit']);
   assert.equal(batch.quarantinedRecords[0].safeDetailCode, 'DEBIT_CREDIT_EXCLUSIVE');
@@ -1240,6 +1654,45 @@ test('schema 9 to 10 migration is deterministic for empty/populated vaults and p
   assert.equal(first.state.domain.devotionalState.activeDevotionalId, schema9.domain.devotionalState.activeDevotionalId);
   assert.equal(validateFoundationDomain(first.state.domain).ok, true);
   assert.deepEqual(migrateState(first.state, {now:V3A_NOW}).state, first.state);
+});
+
+test('schema 9 to 10 migration never derives CSV account identity from duplicate display labels', () => {
+  const schema9 = toSchema9(freshState());
+  const baseAccount = {
+    id:'legacy-csv-same-label-a', institutionId:null, externalAccountId:null, friendlyName:'Checking', officialName:'Checking',
+    mask:null, type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  const secondAccount = {...baseAccount, id:'legacy-csv-same-label-b'};
+  schema9.domain.accounts.push(baseAccount, secondAccount);
+  schema9.domain.transactions.push(
+    {
+      id:'legacy-csv-same-label-tx-a', accountId:baseAccount.id, source:'csv', sourceTransactionId:'shared-external-id',
+      rawName:'First', merchantName:'First', amountCents:-525, currency:'USD', authorizedAt:null, postedAt:'2026-08-01',
+      displayDate:'2026-08-01', pendingStatus:'posted', movementType:'unclassified', reviewStatus:'pending',
+      locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null, manualOverrides:null,
+      createdAt:V3A_NOW, updatedAt:V3A_NOW
+    },
+    {
+      id:'legacy-csv-same-label-tx-b', accountId:secondAccount.id, source:'csv', sourceTransactionId:'shared-external-id',
+      rawName:'Second', merchantName:'Second', amountCents:-750, currency:'USD', authorizedAt:null, postedAt:'2026-08-02',
+      displayDate:'2026-08-02', pendingStatus:'posted', movementType:'unclassified', reviewStatus:'pending',
+      locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null, manualOverrides:null,
+      createdAt:V3A_NOW, updatedAt:V3A_NOW
+    }
+  );
+
+  const migrated = migrateState(schema9, {now:V3A_NOW}).state;
+  const accounts = migrated.domain.accounts.filter(item => item.id.startsWith('legacy-csv-same-label-'));
+  const transactions = migrated.domain.transactions.filter(item => item.id.startsWith('legacy-csv-same-label-tx-'));
+  assert.deepEqual(
+    accounts.map(item => item.sourceAccountRef).sort(),
+    ['account:legacy-csv-same-label-a', 'account:legacy-csv-same-label-b']
+  );
+  assert.notEqual(transactions[0].sourceAccountRef, transactions[1].sourceAccountRef);
+  assert.equal(transactions[0].sourceRecordRef, 'shared-external-id');
+  assert.equal(transactions[1].sourceRecordRef, 'shared-external-id');
+  assert.equal(validateDomainStore(migrated.domain).ok, true);
 });
 
 test('schema 9 migration rejects malformed input clone-first with no partial migration', () => {
