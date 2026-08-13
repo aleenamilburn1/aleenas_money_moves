@@ -1,14 +1,15 @@
 # Money Moves V3A — Provider-Neutral Ingestion Implementation
 
 Date: 2026-08-13
-Status: CANDIDATES 1–4 REJECTED; SCHEMA-9 / CSV SOURCE-REFERENCE REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
+Status: CANDIDATES 1–5 REJECTED; ACCOUNT-IDENTITY DOMAIN-SEPARATION REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
 Domain schema: 10
 Trusted parent: `5d2c44925931292724bc4a2d62cfade3c969f606` (`v3-plaid-architecture-accepted`)
 Rejected Candidate 1: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
 Rejected Candidate 2: `c2adfaca8411b2bdc9a050097452021e79928fcb` (`v3a-provider-neutral-ingestion-candidate-2`)
 Rejected Candidate 3: `dce5bb2c812fef1332e3c81153f93a68de0a6871` (`v3a-provider-neutral-ingestion-candidate-3`)
 Rejected Candidate 4: `72f21872d70504db5d11f79ec18c3d53e94c42da` (`v3a-provider-neutral-ingestion-candidate-4`)
-Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-5`
+Rejected Candidate 5: `7731fdc519d71420ddf4cee655a03e5303584090` (`v3a-provider-neutral-ingestion-candidate-5`)
+Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-6`
 
 ## Outcome and scope
 
@@ -76,6 +77,16 @@ therefore created one duplicate account and one duplicate transaction.
 Candidate 5 fixes only this raw-versus-canonical source-reference mismatch and
 its direct migration, candidate-state, atomicity, and backup/restore surface.
 
+Independent acceptance rejected Candidate 5 after reproducing an eighth
+blocker. An explicit raw account ID `foo` encoded to `external:foo`, while a
+saved mapping value `external:foo` was accepted verbatim. The adapter therefore
+emitted one account mutation and reconciliation created one canonical account
+for two different identity mechanisms. Both transactions attached to that one
+account. Candidate 6 adds explicit identity-domain provenance and one
+centralized injective source-account encoder so external, mapping,
+migrated-local, direct adapter, and Unknown identities cannot collapse solely
+because their payload strings look alike.
+
 ## Requirements affected
 
 The implementation follows the PRD's provider-metadata, traceability,
@@ -93,7 +104,8 @@ principles. It implements or strengthens the data/service foundations for:
 - `ACT-001`–`ACT-003`: stable local accounts are separate from source account
   references, and source changes do not replace friendly names or visibility.
 - `SET-003`: an existing saved CSV account mapping may provide stable account
-  identity; mapping labels normalize only case, Unicode form, and whitespace.
+  identity; mapping labels normalize only case, Unicode form, and whitespace,
+  while mapping identity payloads remain opaque and profile-scoped.
 - `IMP-001`: rows lacking both an explicit account ID and a saved mapping fail
   with a bounded, actionable typed error before commit.
 - `LOC-001`–`LOC-002`: unknown location remains explicit and ordinary canonical
@@ -137,8 +149,11 @@ ingestion. A raw ID is opaque after contract-approved outer trimming: no case,
 Unicode, punctuation, colon, or internal-whitespace normalization occurs. Raw
 `foo` becomes `external:foo`; raw `external:foo` becomes
 `external:external:foo`, so prefix-looking raw data cannot collapse with
-already-canonical data. Deterministic `file:<digest>:row:<line>` fallbacks and
-explicit saved-mapping references remain separate reference domains.
+already-canonical data. Candidate 6 routes account identities through
+`encodeSourceAccountReference(domain, rawValue)` and persists the corresponding
+`sourceAccountIdentityDomain` on accounts, transactions, quarantines, and
+tombstones. Deterministic `file:<digest>:row:<line>` transaction fallbacks
+remain a separate record-reference domain.
 
 The schema-9→10 migration never uses account display metadata as identity. A
 unique legacy external account ID remains authoritative; otherwise the stable
@@ -151,8 +166,8 @@ external ID. This path is covered directly by migration tests.
 Local ownership and source identity are distinct:
 
 ```text
-account source key     = sourceKind + sourceNamespace + sourceAccountRef
-transaction source key = sourceKind + sourceNamespace + sourceAccountRef + sourceRecordRef
+account source key     = sourceKind + sourceNamespace + sourceAccountIdentityDomain + sourceAccountRef
+transaction source key = sourceKind + sourceNamespace + sourceAccountIdentityDomain + sourceAccountRef + sourceRecordRef
 local account ID       = Money Moves-owned stable ID
 local transaction ID   = Money Moves-owned stable ID
 ```
@@ -166,17 +181,40 @@ Semantic similarity—date, amount, merchant, description, or category—is neve
 used as an identity or automatic pending match. Pending aliases remain indexed
 to the same local transaction after a valid posted replacement.
 
+`sourceAccountRef` is no longer treated as an untyped string. The canonical
+contract recognizes these current identity domains:
+
+- `external`: opaque source-provided account IDs; raw `foo` becomes
+  `external:foo`, and raw prefix-looking values are encoded again rather than
+  interpreted;
+- `mapping`: opaque values obtained from explicit saved import-profile
+  mappings; value `external:foo` becomes `mapping:external:foo`;
+- `migrated_local`: stable local-account-derived fallback used only when the
+  schema-9 migration has no unique external identity;
+- `direct`: explicit account references supplied to manual and provider-neutral
+  fixture adapters;
+- `unknown`: the one structural `unknown-account` sentinel.
+
+The domain is selected structurally by the adapter or migration path, never by
+examining prefix-looking payload text. Each non-Unknown domain has a disjoint
+canonical prefix and opaque payload, making encoding injective both within and
+across domains. The closed batch and persisted models carry and validate
+`sourceAccountIdentityDomain`; transactions must agree with their referenced
+canonical account. The Unknown sentinel is the only deliberate cross-namespace
+shared account.
+
 ### CSV source-account resolution hierarchy
 
 CSV account identity is resolved once per row in this order:
 
 1. A non-empty native `account_id` (or configured account-ID column) becomes
-   `external:<source-value>`.
+   domain `external` and reference `external:<source-value>`.
 2. Otherwise, a saved import-profile `accountMappings` entry may provide an
-   explicit stable source-account reference. Mapping labels receive only NFKC,
+   explicit stable source-account identity. Mapping labels receive only NFKC,
    trim, repeated-whitespace, and case normalization. The mapping value—not the
-   descriptive label—is identity. `unknown-account`, legacy `label:` refs,
-   controls, empty refs, and oversized refs are invalid mappings.
+   descriptive label—is the opaque identity payload and is encoded in domain
+   `mapping`. `unknown-account`, legacy `label:` refs, controls, empty refs, and
+   oversized encoded refs are invalid mappings.
 3. There is no metadata-derived fallback. A row without either source returns
    typed `CSV_ACCOUNT_IDENTITY_AMBIGUOUS`, with bounded row numbers and a future
    remediation action but no account label, institution, mask, or financial
@@ -196,7 +234,9 @@ Identity and metadata classifications are:
   an already-stable local account ID when no unique external ID exists.
 - **Import-profile identity:** `profile.id` establishes the CSV namespace and
   `accountMappings` stores explicit label-to-stable-ref decisions. The label is
-  a selector inside that saved decision, not global account identity.
+  a selector inside that saved decision, not global account identity. Equal
+  label/value pairs in two profiles remain separate because their
+  `sourceNamespace` values differ; there is no global linkage by mapping text.
 - **Source account metadata:** official/display label, institution text and
   source institution ref, mask, type, subtype, currency, balances, source
   status, and source metadata. These may update only after stable identity is
@@ -216,7 +256,8 @@ mismatches fail before reconciliation.
 
 The digest covers semantic source/content identity: contract version, stable
 batch/source/adapter identity, checkpoint, ordered account and transaction
-mutations, quarantine facts, and warnings. It intentionally excludes
+mutations (including account identity domain), quarantine facts, and warnings.
+It intentionally excludes
 `producedAt`, the observation envelope, and per-item `observedAt` fields. Those
 timestamps remain validated and available for diagnostics and audit, but they
 cannot turn identical source content into a conflicting receipt. A replayed
@@ -358,6 +399,13 @@ label mapping can identify one otherwise unambiguous account; if multiple rows
 assigned to that mapping carry conflicting account facts, the complete adapter
 operation fails before a batch exists.
 
+Explicit `account_id` remains authoritative if both it and a saved mapping are
+available. Mapping-key normalization never applies to mapping identity payloads.
+Grouping uses the domain-aware canonical reference, so external raw `foo` and
+mapping value `external:foo` produce two account mutations, two canonical
+accounts, and exact transaction-to-account assignments without metadata
+crossover. Reimport in either domain remains stable.
+
 The existing CSV button now submits the canonical batch through StateService.
 Its legacy review-card projection remains a compatibility view, not an
 independent financial source of truth. The older CSV helper no longer uses
@@ -418,9 +466,16 @@ and these three engineering documents. It adds no schema version, migration
 step, dependency, UI, backend, network path, credential, provider product, FX
 behavior, Reports UI, or build artifact.
 
+Candidate 6 changes `js/domain/ingestionContract.js`, `js/domain/migrations.js`,
+`js/domain/models.js`, `js/adapters/adapterUtils.js`, all three V3A adapters,
+`js/services/ingestionService.js`, `test/provider-neutral-ingestion.test.js`,
+and these three engineering documents. It adds no dependency, schema version,
+migration step, UI, backend, network path, credential, provider product, FX
+behavior, Reports UI, or build artifact.
+
 ## Tests and fixtures
 
-The 114 focused V3A checks use only synthetic manual, CSV, and fixture-provider
+The 125 focused V3A checks use only synthetic manual, CSV, and fixture-provider
 values.
 They cover exact cents and sign matrices; malformed, huge, zero, missing,
 invalid, and foreign-currency values; closed contract limits; account and
@@ -458,17 +513,31 @@ identity preservation; pending, removed, and manual-history preservation;
 changed-add fail-closed atomicity; unreleased pre-canonical schema-10 refusal;
 and encrypted migration backup/restore followed by zero-duplicate reimport.
 
-Full remediation validation records 345 unit tests, 114 focused V3A tests, and
+Candidate 6 adds the exact Candidate-5 `foo` / mapping `external:foo`
+reproduction, a cross-domain collision matrix, within-domain injectivity for
+Unicode/punctuation/colon/prefix-looking/case/whitespace payloads, mapping-key
+versus identity-payload separation, cross-profile scoping, explicit-ID
+precedence, account grouping and assignment, same transaction ID across
+identity domains, semantic-digest separation, migrated external versus mapped
+identity, mixed-domain atomic retry, encrypted dual-domain restore/reimport,
+and fail-closed schema-10 candidate state without domain provenance.
+
+Full remediation validation records 356 unit tests, 125 focused V3A tests, and
 38 Electron-focused tests,
 all passing with zero failures, skips, or todos. No dependency was added.
 
 ## Schema decision
 
-The schema remains 10. Candidate 5 corrects the not-yet-accepted schema-9→10
-conversion and adapter boundary before V3A release; it changes no persisted
-entity shape. A unique CSV external reference is encoded through the shared
-contract function, while records without one still use a stable local account
-or transaction ID and never a display label.
+The schema remains 10 because V3A has not been accepted or released. Candidate
+6 corrects the not-yet-accepted schema-9→10 conversion and adapter boundary in
+place. Schema-10 accounts, transactions, quarantines, and tombstones now carry
+the structural `sourceAccountIdentityDomain` required to interpret their
+canonical account reference. The migration assigns `external` only from a
+unique legacy external CSV account ID, `migrated_local` when a stable local ID
+is the only trustworthy CSV identity, `direct` for explicit manual and fixture
+adapter references, and `unknown` only for the structural Unknown sentinel.
+Current CSV ingestion selects `external` from the explicit source-ID branch and
+`mapping` from the saved-mapping branch.
 
 Candidates 1–4 could nevertheless have written unreleased schema-10 vaults with
 unsafe `label:` source-account refs. Those refs may be present on accounts,
@@ -489,11 +558,20 @@ closed with `CSV_LEGACY_EXTERNAL_REFERENCE_UNRESOLVED`; arbitrary raw and
 canonical strings are never silently equated. No schema 11 was introduced
 because no V3A schema 10 candidate was accepted or released.
 
-Candidate 3's legacy receipt proof remains unchanged for explicit or corrected
-mapped identities. Malformed, missing-effect, wrong-account, wrong-reference,
-unrelated-batch, partial, contradictory, and changed-payload cases still fail
-closed; active, later-modified, tombstoned, and quarantined evidence remains
-provable.
+Candidate 4 and Candidate 5 schema-10 CSV state predates domain provenance.
+Prefix-looking text cannot establish whether a reference came from an external
+ID, a saved mapping, or an earlier canonicalization step, and a collision may
+already have merged identities. Candidate 6 therefore does not infer a domain,
+rewrite receipts, or split accounts from string contents. Migration/unlock and
+same-namespace reconciliation fail closed with
+`CSV_LEGACY_ACCOUNT_IDENTITY_DOMAIN_UNRESOLVED` for controlled remediation.
+No schema 11 is introduced for unreleased candidate state.
+
+Candidate 3's legacy receipt proof now includes domain provenance in persisted
+effect checks. Legitimate active, later-modified, tombstoned, and quarantined
+evidence remains provable. Malformed, missing-effect, wrong-domain,
+wrong-account, wrong-reference, unrelated-batch, partial, contradictory, and
+changed-payload cases still fail closed.
 
 ## Security and scope review
 
@@ -505,7 +583,7 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Known limitations
 
-- Candidates 1–4 were rejected; Candidate 5 awaits independent re-acceptance.
+- Candidates 1–5 were rejected; Candidate 6 awaits independent re-acceptance.
 - There is no dedicated account-mapping UI in V3A. CSVs without stable account
   IDs require an existing saved mapping; same-label distinct accounts require
   distinct source IDs or a future richer explicit mapping workflow.
@@ -514,8 +592,11 @@ interpretation continue to persist only through the existing encrypted vault.
   remediation.
 - Unreleased schema-10 raw migrated external references are detected only by a
   deterministic same-namespace account/transaction match and fail closed for
-  controlled remediation; Candidate 5 does not guess or rewrite candidate
+  controlled remediation; Candidate 6 does not guess or rewrite candidate
   history.
+- Unreleased Candidate-4/5 schema-10 CSV identities without structural domain
+  provenance fail closed. Candidate 6 cannot safely reconstruct or separate
+  identities that a rejected candidate may already have collapsed.
 - A structurally valid Candidate-1 receipt is insufficient by itself. Legacy
   replay fails closed when schema-10 state cannot independently prove its
   effects, including genuinely empty legacy batches and account-source changes
@@ -533,8 +614,8 @@ interpretation continue to persist only through the existing encrypted vault.
 ## Recommended next task
 
 Run an independent V3A re-acceptance review from
-`v3a-provider-neutral-ingestion-candidate-5`. Re-read the
+`v3a-provider-neutral-ingestion-candidate-6`. Re-read the
 five authoritative V3 documents, audit schema-9 migration and field ownership,
-repeat the 345-unit/114-focused/38-Electron validation gate, add adversarial cases if any
+repeat the 356-unit/125-focused/38-Electron validation gate, add adversarial cases if any
 gap is found, and issue a separate acceptance or rejection record. Do not begin
 V3B from this implementation report alone.

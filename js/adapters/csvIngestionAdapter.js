@@ -1,5 +1,11 @@
 import {normalizeCurrency, parseExactUsdAmount} from '../domain/exactMoney.js';
-import {canonicalExternalSourceReference, sha256Text, stableCanonicalJson} from '../domain/ingestionContract.js';
+import {
+  canonicalExternalSourceReference,
+  encodeSourceAccountReference,
+  SOURCE_ACCOUNT_IDENTITY_DOMAINS,
+  sha256Text,
+  stableCanonicalJson
+} from '../domain/ingestionContract.js';
 import {parseCsv} from '../csv.js';
 import {finishAdapterBatch, normalizedAccount, normalizedTransaction, quarantineRecord} from './adapterUtils.js';
 
@@ -60,10 +66,11 @@ function accountType(value) {
   return ['cash', 'depository', 'credit', 'loan', 'savings', 'investment', 'other', 'unknown'].includes(type) ? type : 'unknown';
 }
 
-function quarantine({ref, accountRef, observedAt, amount, currency, reason, code}) {
+function quarantine({ref, accountIdentity, observedAt, amount, currency, reason, code}) {
   return quarantineRecord({
     sourceRecordRef:ref,
-    sourceAccountRef:accountRef,
+    sourceAccountRef:accountIdentity.sourceAccountRef,
+    sourceAccountIdentityDomain:accountIdentity.sourceAccountIdentityDomain,
     observedAt,
     reason,
     rawAmountDecimal:amount || null,
@@ -88,22 +95,33 @@ function accountMappingIndex(accountMappings) {
     if (!normalizedLabel || !stableReference) {
       throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_entries_require_label_and_reference'});
     }
-    if (stableReference === 'unknown-account' || stableReference.startsWith('label:')
-      || stableReference.length > 256 || /[\u0000-\u001f\u007f]/u.test(stableReference)) {
+    if (stableReference === 'unknown-account' || stableReference.startsWith('label:')) {
+      throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_reference_is_not_stable'});
+    }
+    let canonicalReference;
+    try {
+      canonicalReference = encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING, stableReference);
+    } catch {
       throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_reference_is_not_stable'});
     }
     const prior = result.get(normalizedLabel);
-    if (prior && prior !== stableReference) {
+    if (prior && prior.sourceAccountRef !== canonicalReference) {
       throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'normalized_mapping_labels_conflict'});
     }
-    result.set(normalizedLabel, stableReference);
+    result.set(normalizedLabel, {
+      sourceAccountRef:canonicalReference,
+      sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING
+    });
   }
   return result;
 }
 
 function sourceAccountReference(row, profile, mappings) {
   const external = firstValue(row, profile.accountIdColumns);
-  if (external) return canonicalExternalSourceReference(external);
+  if (external) return {
+    sourceAccountRef:canonicalExternalSourceReference(external),
+    sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL
+  };
   const label = firstValue(row, profile.accountColumns);
   const mapped = mappings.get(normalizedMappingLabel(label));
   return mapped || null;
@@ -202,9 +220,9 @@ export async function createCsvMutationBatch({
   const resolvedRows = parsedRows.map((row, index) => ({
     row,
     line:index + 2,
-    sourceAccountRef:sourceAccountReference(row, profile, mappings)
+    sourceAccountIdentity:sourceAccountReference(row, profile, mappings)
   }));
-  const ambiguousRows = resolvedRows.filter(item => item.sourceAccountRef === null).map(item => item.line);
+  const ambiguousRows = resolvedRows.filter(item => item.sourceAccountIdentity === null).map(item => item.line);
   if (ambiguousRows.length) {
     throw new CsvAccountIdentityError('CSV_ACCOUNT_IDENTITY_AMBIGUOUS', {
       rowNumbers:ambiguousRows.slice(0, 100),
@@ -213,7 +231,8 @@ export async function createCsvMutationBatch({
     });
   }
 
-  for (const {row, line, sourceAccountRef} of resolvedRows) {
+  for (const {row, line, sourceAccountIdentity} of resolvedRows) {
+    const {sourceAccountRef, sourceAccountIdentityDomain} = sourceAccountIdentity;
     const externalRef = firstValue(row, profile.transactionIdColumns);
     const sourceRecordRef = externalRef ? canonicalExternalSourceReference(externalRef) : `file:${fileDigest}:row:${line}`;
     const observedAt = producedAt;
@@ -244,19 +263,19 @@ export async function createCsvMutationBatch({
     }
 
     if (!date) {
-      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountRef:sourceAccountRef, observedAt, amount:amountInput.decimal, currency:currencyText, reason:'invalid_source_record', code:'INVALID_SOURCE_DATE'}));
+      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountIdentity:sourceAccountIdentity, observedAt, amount:amountInput.decimal, currency:currencyText, reason:'invalid_source_record', code:'INVALID_SOURCE_DATE'}));
       continue;
     }
     if (!currency) {
-      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountRef:sourceAccountRef, observedAt, amount:amountInput.decimal, currency:currencyText, reason:'invalid_source_record', code:'INVALID_CURRENCY'}));
+      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountIdentity:sourceAccountIdentity, observedAt, amount:amountInput.decimal, currency:currencyText, reason:'invalid_source_record', code:'INVALID_CURRENCY'}));
       continue;
     }
     if (currency !== 'USD') {
-      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountRef:sourceAccountRef, observedAt, amount:amountInput.decimal, currency, reason:'unsupported_currency', code:'CURRENCY_NOT_ACTIVE'}));
+      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountIdentity:sourceAccountIdentity, observedAt, amount:amountInput.decimal, currency, reason:'unsupported_currency', code:'CURRENCY_NOT_ACTIVE'}));
       continue;
     }
     if (amountInput.error) {
-      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountRef:sourceAccountRef, observedAt, amount:amountInput.decimal, currency, reason:'unsafe_amount', code:amountInput.error}));
+      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountIdentity:sourceAccountIdentity, observedAt, amount:amountInput.decimal, currency, reason:'unsafe_amount', code:amountInput.error}));
       continue;
     }
     const convention = signConvention(profile);
@@ -264,7 +283,7 @@ export async function createCsvMutationBatch({
     try {
       parsed = parseExactUsdAmount(amountInput.decimal, {signConvention:convention, direction:amountInput.direction, allowZero:false});
     } catch (error) {
-      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountRef:sourceAccountRef, observedAt, amount:amountInput.decimal, currency, reason:'unsafe_amount', code:error.code || 'INVALID_AMOUNT'}));
+      quarantinedRecords.push(quarantine({ref:sourceRecordRef, accountIdentity:sourceAccountIdentity, observedAt, amount:amountInput.decimal, currency, reason:'unsafe_amount', code:error.code || 'INVALID_AMOUNT'}));
       continue;
     }
     const metadata = amountInput.direction ? {debitCreditDirection:amountInput.direction} : {};
@@ -272,6 +291,7 @@ export async function createCsvMutationBatch({
       kind:'add',
       sourceRecordRef,
       sourceAccountRef,
+      sourceAccountIdentityDomain,
       observedAt,
       record:normalizedTransaction({
         lifecycle:'posted',
@@ -299,9 +319,14 @@ export async function createCsvMutationBatch({
     });
   }
 
+  const identityDomains = new Map(resolvedRows.map(item => [
+    item.sourceAccountIdentity?.sourceAccountRef,
+    item.sourceAccountIdentity?.sourceAccountIdentityDomain
+  ]));
   const accountMutations = [...accountFacts.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([sourceAccountRef, grouped]) => ({
     kind:'add',
     sourceAccountRef,
+    sourceAccountIdentityDomain:identityDomains.get(sourceAccountRef),
     observedAt:producedAt,
     account:normalizedAccount(grouped.account)
   }));

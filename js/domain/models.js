@@ -3,6 +3,7 @@ import {
   DEVOTIONAL_RESPONSE_MAX_CHARS, SYSTEM_BUCKET_IDS, UNKNOWN_ACCOUNT_ID
 } from './constants.js';
 import {FAITH_MONEY_DEVOTIONALS, devotionalById} from '../content/faithMoneyDevotionals.js';
+import {SOURCE_ACCOUNT_IDENTITY_DOMAINS, sourceAccountReferenceMatchesDomain} from './ingestionContract.js';
 
 export const ACCOUNT_TYPES = new Set(['cash', 'depository', 'credit', 'loan', 'savings', 'investment', 'other', 'unknown']);
 export const TRANSACTION_SOURCES = new Set(['manual', 'csv', 'migration', 'provider']);
@@ -21,6 +22,7 @@ export const REIMBURSEMENT_ADJUSTMENT_TYPES = new Set(['write_off', 'write_off_r
 export const AUDIT_EVENT_SOURCES = new Set(['user', 'migration', 'reconciliation']);
 export const REIMBURSEMENT_STATUSES = new Set(['cancelled', 'open', 'partially_paid', 'settled', 'written_off']);
 export const SOURCE_KINDS = new Set(['manual', 'csv', 'provider']);
+export const SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET = new Set(Object.values(SOURCE_ACCOUNT_IDENTITY_DOMAINS));
 export const SOURCE_LIFECYCLES = new Set(['pending', 'posted', 'removed', 'unknown']);
 export const ALLOCATION_STATUSES = new Set(['active', 'superseded']);
 export const INGESTION_RESULT_COUNT_FIELDS = Object.freeze([
@@ -175,6 +177,10 @@ export function validateAccount(value) {
     requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
     requiredString(value.sourceNamespace, 'sourceNamespace', errors);
     requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
+    requiredEnum(value.sourceAccountIdentityDomain, 'sourceAccountIdentityDomain', SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, errors);
+    if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+      errors.push('sourceAccountRef does not match sourceAccountIdentityDomain');
+    }
     optionalString(value.connectionId, 'connectionId', errors);
     optionalString(value.institutionName, 'institutionName', errors);
     optionalString(value.providerDisplayName, 'providerDisplayName', errors);
@@ -215,6 +221,10 @@ export function validateTransaction(value) {
     requiredString(value.sourceNamespace, 'sourceNamespace', errors);
     requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
     requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
+    requiredEnum(value.sourceAccountIdentityDomain, 'sourceAccountIdentityDomain', SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, errors);
+    if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+      errors.push('sourceAccountRef does not match sourceAccountIdentityDomain');
+    }
     requiredEnum(value.sourceLifecycle, 'sourceLifecycle', SOURCE_LIFECYCLES, errors);
     optionalObject(value.sourceAmount, 'sourceAmount', errors);
     if (isPlainObject(value.sourceAmount)) {
@@ -593,6 +603,14 @@ function validateSourceQuarantine(value) {
   requiredString(value.sourceNamespace, 'sourceNamespace', errors);
   requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
   optionalString(value.sourceAccountRef, 'sourceAccountRef', errors);
+  if (value.sourceAccountRef === null) {
+    if (value.sourceAccountIdentityDomain !== null) errors.push('sourceAccountIdentityDomain must be null without sourceAccountRef');
+  } else {
+    requiredEnum(value.sourceAccountIdentityDomain, 'sourceAccountIdentityDomain', SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, errors);
+    if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+      errors.push('sourceAccountRef does not match sourceAccountIdentityDomain');
+    }
+  }
   requiredEnum(value.reason, 'reason', new Set(['unsupported_currency', 'unsafe_amount', 'missing_account', 'invalid_source_record']), errors);
   optionalString(value.rawAmountDecimal, 'rawAmountDecimal', errors);
   optionalString(value.sourceCurrency, 'sourceCurrency', errors);
@@ -611,6 +629,10 @@ function validateSourceTombstone(value) {
   requiredString(value.sourceNamespace, 'sourceNamespace', errors);
   requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
   requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
+  requiredEnum(value.sourceAccountIdentityDomain, 'sourceAccountIdentityDomain', SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, errors);
+  if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+    errors.push('sourceAccountRef does not match sourceAccountIdentityDomain');
+  }
   requiredString(value.reason, 'reason', errors);
   optionalString(value.predecessorOfRef, 'predecessorOfRef', errors);
   requiredTimestamp(value.observedAt, 'observedAt', errors);
@@ -765,6 +787,16 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
   const transactionSourceKeys = new Map();
   for (const transaction of domain.transactions) {
     if (!transaction.sourceKind) continue;
+    const sourceAccount = domain.accounts.find(account => account.id === transaction.accountId);
+    const explicitUnknownAccount = sourceAccount?.id === UNKNOWN_ACCOUNT_ID
+      && transaction.sourceAccountRef === 'unknown-account'
+      && transaction.sourceAccountIdentityDomain === SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN;
+    if (!explicitUnknownAccount && sourceAccount?.sourceKind && (
+      sourceAccount.sourceKind !== transaction.sourceKind
+      || sourceAccount.sourceNamespace !== transaction.sourceNamespace
+      || sourceAccount.sourceAccountRef !== transaction.sourceAccountRef
+      || sourceAccount.sourceAccountIdentityDomain !== transaction.sourceAccountIdentityDomain
+    )) errors.push(`transaction ${transaction.id} source-account identity does not match account ${sourceAccount.id}`);
     for (const reference of [transaction.sourceRecordRef, ...(transaction.sourceRefAliases || []).map(alias => alias.sourceRecordRef)]) {
       const key = `${transaction.sourceKind}|${transaction.sourceNamespace}|${transaction.sourceAccountRef}|${reference}`;
       if (transactionSourceKeys.has(key) && transactionSourceKeys.get(key) !== transaction.id) {

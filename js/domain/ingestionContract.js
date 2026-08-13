@@ -3,6 +3,13 @@ import {normalizeCurrency, parseActiveUsdSourceAmount, SOURCE_SIGN_CONVENTIONS} 
 export const INGESTION_CONTRACT_VERSION = 1;
 export const SOURCE_KINDS = Object.freeze(['manual', 'csv', 'provider']);
 export const V3A_ADAPTER_KINDS = Object.freeze(['manual.v1', 'csv.generic.v1', 'fixture.v1']);
+export const SOURCE_ACCOUNT_IDENTITY_DOMAINS = Object.freeze({
+  EXTERNAL:'external',
+  MAPPING:'mapping',
+  MIGRATED_LOCAL:'migrated_local',
+  DIRECT:'direct',
+  UNKNOWN:'unknown'
+});
 export const INGESTION_LIMITS = Object.freeze({
   encodedBatchBytes:1_048_576,
   accountMutations:1_000,
@@ -16,6 +23,13 @@ export const INGESTION_LIMITS = Object.freeze({
 });
 
 const SOURCE_KIND_SET = new Set(SOURCE_KINDS);
+const SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET = new Set(Object.values(SOURCE_ACCOUNT_IDENTITY_DOMAINS));
+const SOURCE_ACCOUNT_IDENTITY_PREFIXES = Object.freeze({
+  [SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL]:'external:',
+  [SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING]:'mapping:',
+  [SOURCE_ACCOUNT_IDENTITY_DOMAINS.MIGRATED_LOCAL]:'account:',
+  [SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT]:'direct:'
+});
 const SIGN_CONVENTION_SET = new Set(SOURCE_SIGN_CONVENTIONS);
 const ACCOUNT_MUTATION_KINDS = new Set(['add', 'modify', 'disconnect']);
 const TRANSACTION_MUTATION_KINDS = new Set(['add', 'modify', 'remove']);
@@ -39,23 +53,61 @@ export class IngestionContractError extends Error {
   }
 }
 
-export function canonicalExternalSourceReference(rawExternalId) {
-  const raw = typeof rawExternalId === 'string' ? rawExternalId.trim() : '';
-  const canonical = `external:${raw}`;
+export function encodeSourceAccountReference(domain, rawValue = null) {
   const errors = [];
-  if (!raw) errors.push('rawExternalId must be a non-empty string');
-  if (canonical.length > INGESTION_LIMITS.refChars) {
-    errors.push(`canonical external source reference exceeds ${INGESTION_LIMITS.refChars} characters`);
+  if (!SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET.has(domain)) errors.push('domain is unsupported');
+  if (domain === SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN) {
+    if (rawValue !== null && rawValue !== undefined && rawValue !== '') errors.push('unknown identity does not accept a payload');
+    if (errors.length) {
+      throw new IngestionContractError(
+        'INVALID_SOURCE_ACCOUNT_REFERENCE',
+        'The source-account identity cannot be represented canonically.',
+        errors
+      );
+    }
+    return 'unknown-account';
   }
-  if (CONTROL_PATTERN.test(canonical)) errors.push('rawExternalId contains control characters');
+  const raw = typeof rawValue === 'string' ? rawValue.trim() : '';
+  const prefix = SOURCE_ACCOUNT_IDENTITY_PREFIXES[domain] || '';
+  const canonical = `${prefix}${raw}`;
+  if (!raw) errors.push('rawValue must be a non-empty string');
+  if (canonical.length > INGESTION_LIMITS.refChars) {
+    errors.push(`canonical source-account reference exceeds ${INGESTION_LIMITS.refChars} characters`);
+  }
+  if (CONTROL_PATTERN.test(canonical)) errors.push('rawValue contains control characters');
   if (errors.length) {
     throw new IngestionContractError(
-      'INVALID_RAW_EXTERNAL_REFERENCE',
-      'The raw external identifier cannot be represented as a canonical source reference.',
+      'INVALID_SOURCE_ACCOUNT_REFERENCE',
+      'The source-account identity cannot be represented canonically.',
       errors
     );
   }
   return canonical;
+}
+
+export function sourceAccountReferenceMatchesDomain(domain, canonicalReference) {
+  if (!SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET.has(domain) || typeof canonicalReference !== 'string') return false;
+  if (domain === SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN) return canonicalReference === 'unknown-account';
+  const prefix = SOURCE_ACCOUNT_IDENTITY_PREFIXES[domain];
+  return canonicalReference.startsWith(prefix)
+    && canonicalReference.length > prefix.length
+    && canonicalReference.length <= INGESTION_LIMITS.refChars
+    && !CONTROL_PATTERN.test(canonicalReference);
+}
+
+export function canonicalExternalSourceReference(rawExternalId) {
+  const errors = [];
+  try {
+    return encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL, rawExternalId);
+  } catch (error) {
+    if (error instanceof IngestionContractError) errors.push(...error.details);
+    else throw error;
+  }
+  throw new IngestionContractError(
+    'INVALID_RAW_EXTERNAL_REFERENCE',
+    'The raw external identifier cannot be represented as a canonical source reference.',
+    errors
+  );
 }
 
 function contractError(code, errors) {
@@ -107,6 +159,9 @@ export async function computeLegacyEnvelopeDigest(batch) {
   // time. Keep this only for fail-closed recognition of its persisted receipts.
   const unsigned = structuredClone(batch);
   delete unsigned.payloadDigest;
+  for (const mutation of unsigned.accountMutations || []) delete mutation.sourceAccountIdentityDomain;
+  for (const mutation of unsigned.transactionMutations || []) delete mutation.sourceAccountIdentityDomain;
+  for (const record of unsigned.quarantinedRecords || []) delete record.sourceAccountIdentityDomain;
   return sha256Text(stableCanonicalJson(unsigned));
 }
 
@@ -222,9 +277,13 @@ function validateAccountRecord(value, path, errors) {
 
 function validateAccountMutation(value, index, errors) {
   const path = `accountMutations[${index}]`;
-  if (!exactFields(value, ['kind', 'sourceAccountRef', 'observedAt', 'account'], path, errors)) return;
+  if (!exactFields(value, ['kind', 'sourceAccountRef', 'sourceAccountIdentityDomain', 'observedAt', 'account'], path, errors)) return;
   enumValue(value.kind, ACCOUNT_MUTATION_KINDS, `${path}.kind`, errors);
   ref(value.sourceAccountRef, `${path}.sourceAccountRef`, errors);
+  enumValue(value.sourceAccountIdentityDomain, SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, `${path}.sourceAccountIdentityDomain`, errors);
+  if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+    errors.push(`${path}.sourceAccountRef does not match its explicit identity domain`);
+  }
   timestamp(value.observedAt, `${path}.observedAt`, errors);
   if (value.kind === 'disconnect') {
     if (value.account !== null) errors.push(`${path}.account must be null for disconnect`);
@@ -304,10 +363,16 @@ function validateRemoval(value, path, errors) {
 
 function validateTransactionMutation(value, index, errors) {
   const path = `transactionMutations[${index}]`;
-  if (!exactFields(value, ['kind', 'sourceRecordRef', 'sourceAccountRef', 'observedAt', 'record', 'removal'], path, errors)) return;
+  if (!exactFields(value, [
+    'kind', 'sourceRecordRef', 'sourceAccountRef', 'sourceAccountIdentityDomain', 'observedAt', 'record', 'removal'
+  ], path, errors)) return;
   enumValue(value.kind, TRANSACTION_MUTATION_KINDS, `${path}.kind`, errors);
   ref(value.sourceRecordRef, `${path}.sourceRecordRef`, errors);
   ref(value.sourceAccountRef, `${path}.sourceAccountRef`, errors);
+  enumValue(value.sourceAccountIdentityDomain, SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, `${path}.sourceAccountIdentityDomain`, errors);
+  if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+    errors.push(`${path}.sourceAccountRef does not match its explicit identity domain`);
+  }
   timestamp(value.observedAt, `${path}.observedAt`, errors);
   if (value.kind === 'remove') {
     if (value.record !== null) errors.push(`${path}.record must be null for remove`);
@@ -331,10 +396,19 @@ function validateTransactionMutation(value, index, errors) {
 function validateQuarantine(value, index, errors) {
   const path = `quarantinedRecords[${index}]`;
   if (!exactFields(value, [
-    'sourceRecordRef', 'sourceAccountRef', 'observedAt', 'reason', 'rawAmountDecimal', 'sourceCurrency', 'safeDetailCode'
+    'sourceRecordRef', 'sourceAccountRef', 'sourceAccountIdentityDomain', 'observedAt', 'reason',
+    'rawAmountDecimal', 'sourceCurrency', 'safeDetailCode'
   ], path, errors)) return;
   ref(value.sourceRecordRef, `${path}.sourceRecordRef`, errors);
   ref(value.sourceAccountRef, `${path}.sourceAccountRef`, errors, {nullable:true});
+  if (value.sourceAccountRef === null) {
+    if (value.sourceAccountIdentityDomain !== null) errors.push(`${path}.sourceAccountIdentityDomain must be null without an account reference`);
+  } else {
+    enumValue(value.sourceAccountIdentityDomain, SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, `${path}.sourceAccountIdentityDomain`, errors);
+    if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
+      errors.push(`${path}.sourceAccountRef does not match its explicit identity domain`);
+    }
+  }
   timestamp(value.observedAt, `${path}.observedAt`, errors);
   enumValue(value.reason, QUARANTINE_REASONS, `${path}.reason`, errors);
   string(value.rawAmountDecimal, `${path}.rawAmountDecimal`, errors, {nullable:true, max:100, nonempty:false});
@@ -416,6 +490,25 @@ function validateDuplicateAndLineageRules(batch, errors) {
   }
 }
 
+function validateAccountIdentityDomainsForSource(batch, errors) {
+  const allowed = batch.sourceKind === 'csv'
+    ? new Set([SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL, SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING])
+    : batch.sourceKind === 'manual' || batch.sourceKind === 'provider'
+      ? new Set([SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT, SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN])
+      : new Set();
+  for (const [field, values] of [
+    ['accountMutations', batch.accountMutations || []],
+    ['transactionMutations', batch.transactionMutations || []],
+    ['quarantinedRecords', batch.quarantinedRecords || []]
+  ]) {
+    values.forEach((value, index) => {
+      if (value.sourceAccountIdentityDomain !== null && !allowed.has(value.sourceAccountIdentityDomain)) {
+        errors.push(`${field}[${index}].sourceAccountIdentityDomain is incompatible with sourceKind ${batch.sourceKind}`);
+      }
+    });
+  }
+}
+
 export async function validateSourceMutationBatch(batch, {adapterKinds = V3A_ADAPTER_KINDS} = {}) {
   const errors = [];
   if (!exactFields(batch, [
@@ -445,6 +538,7 @@ export async function validateSourceMutationBatch(batch, {adapterKinds = V3A_ADA
   (batch.transactionMutations || []).forEach((value, index) => validateTransactionMutation(value, index, errors));
   (batch.quarantinedRecords || []).forEach((value, index) => validateQuarantine(value, index, errors));
   (batch.sourceWarnings || []).forEach((value, index) => validateWarning(value, index, errors));
+  validateAccountIdentityDomainsForSource(batch, errors);
   validateDuplicateAndLineageRules(batch, errors);
   const encodedBytes = new TextEncoder().encode(stableCanonicalJson(batch)).length;
   if (encodedBytes > INGESTION_LIMITS.encodedBatchBytes) errors.push('batch exceeds the encoded byte limit');

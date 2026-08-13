@@ -14,7 +14,7 @@
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
 - V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
 - V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Candidate 2 is independently accepted by `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`; annotated tag `v3-plaid-architecture-accepted` identifies the documentation-only acceptance checkpoint.
-- V3A provider-neutral ingestion Candidates 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`), 2 (`c2adfaca8411b2bdc9a050097452021e79928fcb`), 3 (`dce5bb2c812fef1332e3c81153f93a68de0a6871`), and 4 (`72f21872d70504db5d11f79ec18c3d53e94c42da`) were rejected by independent acceptance. Their four annotated candidate tags remain preserved. Candidate 5 aligns schema-9 migrated CSV identity with adapter identity, retains schema 10, and is identified by annotated tag `v3a-provider-neutral-ingestion-candidate-5` after all gates pass. Candidate 5 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
+- V3A provider-neutral ingestion Candidates 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`), 2 (`c2adfaca8411b2bdc9a050097452021e79928fcb`), 3 (`dce5bb2c812fef1332e3c81153f93a68de0a6871`), 4 (`72f21872d70504db5d11f79ec18c3d53e94c42da`), and 5 (`7731fdc519d71420ddf4cee655a03e5303584090`) were rejected by independent acceptance. Their five annotated candidate tags remain preserved. Candidate 6 separates external, saved-mapping, migrated-local, direct-adapter, and Unknown account identities with structural persisted provenance, retains schema 10, and is identified by annotated tag `v3a-provider-neutral-ingestion-candidate-6` after all gates pass. Candidate 6 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
 
 ## Desktop foundation
 
@@ -306,10 +306,36 @@ unsafe `label:` refs and deterministically matched pre-canonical migrated refs
 fail closed for controlled remediation. No schema 11 was added because V3A has
 not been accepted or released.
 
+Independent acceptance rejected Candidate 5 because external and saved-mapping
+account identities shared an untyped string space. Explicit raw ID `foo`
+encoded to `external:foo`, while mapping value `external:foo` was accepted as
+that same reference. The adapter emitted one account mutation and attached both
+transactions to one canonical account.
+
+Candidate 6 centralizes account-reference encoding and persists structural
+`sourceAccountIdentityDomain` on accounts, transactions, quarantines, and
+tombstones. The domains are `external`, `mapping`, `migrated_local`, `direct`,
+and `unknown`; their canonical encodings are disjoint and payloads remain
+opaque. The CSV adapter selects the domain from its resolution branch, never
+from prefix-looking content. An explicit account ID remains authoritative over
+a mapping. Mapping keys normalize only for lookup, while mapping values are
+encoded without semantic normalization and remain scoped by the import-profile
+namespace. Grouping, reconciliation, transaction assignment, receipt digests,
+migration, validation, audit proof, and encrypted backup/restore retain the
+domain.
+
+Schema-9 migration assigns a domain only from structural evidence and never
+from account labels, masks, institutions, or prefix-looking strings. Candidate
+4/5 schema-10 CSV state has no persisted evidence that can distinguish an
+external identity from a mapping identity and may already contain a collapse.
+Candidate 6 does not guess, rewrite receipts, or split accounts; migration and
+same-namespace reconciliation fail closed with
+`CSV_LEGACY_ACCOUNT_IDENTITY_DOMAIN_UNRESOLVED` for controlled remediation.
+Schema remains 10 because no V3A candidate has been accepted or released.
+
 Canonical transaction identity is now
-`sourceKind + sourceNamespace + sourceAccountRef + sourceRecordRef`. This uses
-schema-10 fields already present, including for external-ID and fallback CSV
-references, and the schema-9→10 migration is corrected in place. One shared
+`sourceKind + sourceNamespace + sourceAccountIdentityDomain + sourceAccountRef + sourceRecordRef`.
+The schema-9→10 migration is corrected in place. One shared
 interpretation predicate covers classification, review state, allocations,
 notes, overrides, and reimbursement-payment use for both ordinary modifications
 and pending-to-posted changes. Allocation/review workflows never assign to
@@ -324,25 +350,25 @@ future local V3R phase without implementing report calculations or snapshots.
 Fresh remediation validation passed:
 
 - `CI=true pnpm run check`: passed.
-- `CI=true pnpm test`: 345 passed, 0 failed, 0 skipped, 0 todo.
+- `CI=true pnpm test`: 356 passed, 0 failed, 0 skipped, 0 todo.
 - `CI=true pnpm run electron:test`: 38 passed, 0 failed, 0 skipped, 0 todo.
-- Focused V3A suite: 114 passed, 0 failed, 0 skipped, 0 todo.
+- Focused V3A suite: 125 passed, 0 failed, 0 skipped, 0 todo.
 - `git diff --check` and the forbidden-capability/security scans: passed.
 
-These are implementation results, not independent acceptance. Candidates 1–4
-and all four annotated tags remain intact; the remediation is identified by
-annotated tag `v3a-provider-neutral-ingestion-candidate-5`. V3B may begin only
+These are implementation results, not independent acceptance. Candidates 1–5
+and all five annotated tags remain intact; the remediation is identified by
+annotated tag `v3a-provider-neutral-ingestion-candidate-6`. V3B may begin only
 after a new, separate V3A review records re-acceptance.
 
 ## Recommended next task
 
 Open a new bounded independent V3A re-acceptance task from
-`v3a-provider-neutral-ingestion-candidate-5`. Re-read
+`v3a-provider-neutral-ingestion-candidate-6`. Re-read
 the PRD, all four V3 architecture documents, the architecture acceptance, and
 the V3A implementation report; independently review schema-9 migration, source
 identity, exact money, ownership, reconciliation, atomic persistence, backup,
-history retention, and scope/privacy boundaries. Repeat the 345-unit and
-38-Electron gates and record acceptance or rejection separately. Do not begin
+history retention, and scope/privacy boundaries. Repeat the 356-unit,
+125-focused, and 38-Electron gates and record acceptance or rejection separately. Do not begin
 V3B, V3C, V3D, V3R, or V3E until each preceding phase receives its own
 implementation and independent acceptance. The remaining human Finder/Dock/
 application-switcher icon-cache visual check remains a low-risk V2D follow-up.

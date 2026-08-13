@@ -1,6 +1,9 @@
 import {STATE_SCHEMA_VERSION, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
 import {
-  canonicalExternalSourceReference, computeLegacyEnvelopeDigest, stableCanonicalJson, validateSourceMutationBatch
+  canonicalExternalSourceReference,
+  computeLegacyEnvelopeDigest,
+  stableCanonicalJson,
+  validateSourceMutationBatch
 } from '../domain/ingestionContract.js';
 import {
   INGESTION_RESULT_COUNT_FIELDS, isAllocationActive, validateDomainStore, validateIngestionReceipt
@@ -143,6 +146,7 @@ function localAccountFromMutation(batch, mutation, {idFactory, now}) {
     sourceKind:batch.sourceKind,
     sourceNamespace:batch.sourceNamespace,
     sourceAccountRef:mutation.sourceAccountRef,
+    sourceAccountIdentityDomain:mutation.sourceAccountIdentityDomain,
     connectionId:batch.sourceKind === 'provider' ? batch.sourceNamespace : null,
     institutionName:source.institution.name,
     providerDisplayName:source.providerDisplayName,
@@ -172,6 +176,9 @@ function applyAccountAddsAndModifications(domain, batch, context, index, counts)
       sourceAudit(domain, {...context, batch, entityType:'account', entityId:account.id, action:'added', changedFields:['source'], observedAt:mutation.observedAt});
       continue;
     }
+    if (existing.sourceAccountIdentityDomain !== mutation.sourceAccountIdentityDomain) {
+      fail('SOURCE_ACCOUNT_IDENTITY_DOMAIN_CONFLICT', 'A source account reference conflicts with its persisted identity domain.');
+    }
     if (mutation.kind === 'add' && batch.sourceKind !== 'csv') {
       if (!accountFactsEqual(existing, mutation.account)) fail('ACCOUNT_ADD_CONFLICT', 'An account add conflicts with existing source facts.');
       continue;
@@ -199,13 +206,23 @@ function applyAccountAddsAndModifications(domain, batch, context, index, counts)
 
 function assertNoUnresolvedLegacyCsvAccountIdentity(domain, batch) {
   if (batch.sourceKind !== 'csv') return;
-  const legacyReference = value => typeof value === 'string' && value.startsWith('label:');
   const persistedCollections = [
     domain?.accounts,
     domain?.transactions,
     domain?.sourceQuarantines,
     domain?.sourceTombstones
   ];
+  const missingPersistedDomain = persistedCollections.some(collection => Array.isArray(collection)
+    && collection.some(item => item.sourceKind === 'csv'
+      && item.sourceNamespace === batch.sourceNamespace
+      && !item.sourceAccountIdentityDomain));
+  if (missingPersistedDomain) {
+    fail(
+      'CSV_LEGACY_ACCOUNT_IDENTITY_DOMAIN_UNRESOLVED',
+      'This CSV import profile has account identity without domain provenance from an unreleased ingestion candidate. Use controlled account remediation before retrying.'
+    );
+  }
+  const legacyReference = value => typeof value === 'string' && value.startsWith('label:');
   const unresolvedPersisted = persistedCollections.some(collection => Array.isArray(collection)
     && collection.some(item => item.sourceKind === 'csv'
       && item.sourceNamespace === batch.sourceNamespace
@@ -255,9 +272,13 @@ function assertNoUnresolvedLegacyCsvAccountIdentity(domain, batch) {
   }
 }
 
-function resolveLocalAccount(domain, batch, sourceAccountRef, index) {
+function resolveLocalAccount(domain, batch, sourceAccountRef, sourceAccountIdentityDomain, index) {
   if (sourceAccountRef === 'unknown-account') return domain.accounts.find(account => account.id === UNKNOWN_ACCOUNT_ID) || null;
-  return index.get(sourceKey(batch.sourceKind, batch.sourceNamespace, sourceAccountRef)) || null;
+  const account = index.get(sourceKey(batch.sourceKind, batch.sourceNamespace, sourceAccountRef)) || null;
+  if (account && account.sourceAccountIdentityDomain !== sourceAccountIdentityDomain) {
+    fail('SOURCE_ACCOUNT_IDENTITY_DOMAIN_CONFLICT', 'A transaction source account conflicts with the persisted account identity domain.');
+  }
+  return account;
 }
 
 function recordSourceFacts(record) {
@@ -449,6 +470,7 @@ function localTransactionFromMutation(batch, mutation, account, context) {
     sourceNamespace:batch.sourceNamespace,
     sourceRecordRef:mutation.sourceRecordRef,
     sourceAccountRef:mutation.sourceAccountRef,
+    sourceAccountIdentityDomain:mutation.sourceAccountIdentityDomain,
     ...facts,
     sourceProvenance:{
       adapterKind:batch.adapterKind,
@@ -510,7 +532,9 @@ function weekStartUtc(value) {
 function applyOrdinaryTransactionMutations(state, domain, batch, context, accounts, transactions, counts) {
   const ordinary = batch.transactionMutations.filter(item => item.kind !== 'remove' && !item.record.predecessorSourceRef);
   for (const mutation of ordinary) {
-    const account = resolveLocalAccount(domain, batch, mutation.sourceAccountRef, accounts);
+    const account = resolveLocalAccount(
+      domain, batch, mutation.sourceAccountRef, mutation.sourceAccountIdentityDomain, accounts
+    );
     if (!account) fail('MISSING_LOCAL_ACCOUNT', 'A transaction does not resolve to a local account.');
     const key = transactionSourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef);
     const existing = transactions.get(key)?.transaction || null;
@@ -556,7 +580,9 @@ function applyOrdinaryTransactionMutations(state, domain, batch, context, accoun
 
 function applyPendingPostedTransitions(state, domain, batch, context, accounts, transactions, counts) {
   for (const mutation of batch.transactionMutations.filter(item => item.kind === 'add' && item.record.predecessorSourceRef)) {
-    const account = resolveLocalAccount(domain, batch, mutation.sourceAccountRef, accounts);
+    const account = resolveLocalAccount(
+      domain, batch, mutation.sourceAccountRef, mutation.sourceAccountIdentityDomain, accounts
+    );
     if (!account) fail('MISSING_LOCAL_ACCOUNT', 'A posted transaction does not resolve to a local account.');
     if (mutation.record.lifecycle !== 'posted') fail('INVALID_PREDECESSOR_TRANSITION', 'Only a posted record may replace a predecessor.');
     const postedKey = transactionSourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef);
@@ -684,6 +710,7 @@ function applyRemovals(state, domain, batch, context, transactions, counts) {
       sourceNamespace:batch.sourceNamespace,
       sourceRecordRef:mutation.sourceRecordRef,
       sourceAccountRef:mutation.sourceAccountRef,
+      sourceAccountIdentityDomain:mutation.sourceAccountIdentityDomain,
       reason:mutation.removal.reason,
       predecessorOfRef:mutation.removal.predecessorOfRef,
       observedAt:mutation.observedAt,
@@ -699,6 +726,9 @@ function applyAccountDisconnects(domain, batch, context, index, counts) {
     if (mutation.sourceAccountRef === 'unknown-account') fail('INVALID_UNKNOWN_ACCOUNT_DISCONNECT', 'The explicit Unknown account cannot be disconnected by a source.');
     const account = index.get(sourceKey(batch.sourceKind, batch.sourceNamespace, mutation.sourceAccountRef));
     if (!account) fail('UNKNOWN_ACCOUNT_DISCONNECT', 'An account disconnect referenced an unknown source account.');
+    if (account.sourceAccountIdentityDomain !== mutation.sourceAccountIdentityDomain) {
+      fail('SOURCE_ACCOUNT_IDENTITY_DOMAIN_CONFLICT', 'An account disconnect conflicts with the persisted identity domain.');
+    }
     if (account.sourceStatus === 'disconnected') continue;
     account.sourceStatus = 'disconnected';
     account.connectionStatus = 'disconnected';
@@ -722,6 +752,7 @@ function applyQuarantines(state, domain, batch, context, transactions, counts) {
         sourceNamespace:batch.sourceNamespace,
         sourceRecordRef:item.sourceRecordRef,
         sourceAccountRef:item.sourceAccountRef,
+        sourceAccountIdentityDomain:item.sourceAccountIdentityDomain,
         observedAt:item.observedAt,
         reason:item.reason,
         rawAmountDecimal:item.rawAmountDecimal,
@@ -826,6 +857,7 @@ function quarantineMatchesBatchRecord(evidence, batch, record) {
     && evidence.sourceNamespace === batch.sourceNamespace
     && evidence.sourceRecordRef === record.sourceRecordRef
     && evidence.sourceAccountRef === record.sourceAccountRef
+    && evidence.sourceAccountIdentityDomain === record.sourceAccountIdentityDomain
     && evidence.reason === record.reason
     && evidence.rawAmountDecimal === record.rawAmountDecimal
     && evidence.sourceCurrency === record.sourceCurrency
@@ -868,7 +900,9 @@ function provesRejectedCandidateCsvEffects(state, receipt, batch) {
   for (const mutation of batch.accountMutations) {
     if (mutation.sourceAccountRef === 'unknown-account') continue;
     const account = accounts.get(sourceKey('csv', batch.sourceNamespace, mutation.sourceAccountRef));
-    if (!account || account.source !== 'csv' || !accountFactsEqual(account, mutation.account)) return false;
+    if (!account || account.source !== 'csv'
+      || account.sourceAccountIdentityDomain !== mutation.sourceAccountIdentityDomain
+      || !accountFactsEqual(account, mutation.account)) return false;
     expectedAccountIds.add(account.id);
   }
 
@@ -878,7 +912,8 @@ function provesRejectedCandidateCsvEffects(state, receipt, batch) {
     const entry = transactions.get(transactionSourceKey(
       'csv', batch.sourceNamespace, mutation.sourceAccountRef, mutation.sourceRecordRef
     ));
-    if (!entry || !transactionHasExpectedHistoricalFacts(entry.transaction, mutation)) return false;
+    if (!entry || entry.transaction.sourceAccountIdentityDomain !== mutation.sourceAccountIdentityDomain
+      || !transactionHasExpectedHistoricalFacts(entry.transaction, mutation)) return false;
     expectedTransactionIds.add(entry.transaction.id);
   }
   if (expectedTransactionIds.size !== batch.transactionMutations.length) return false;

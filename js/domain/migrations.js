@@ -2,7 +2,11 @@ import {PRODUCT_NAME, STARTER_SPENDING_BUCKETS, STATE_SCHEMA_VERSION, SYSTEM_BUC
 import {FAITH_MONEY_DEVOTIONALS} from '../content/faithMoneyDevotionals.js';
 import {createUnknownAccount, validateAuditEvent, validateDomainStore, validateBucket} from './models.js';
 import {formatSignedCents} from './exactMoney.js';
-import {canonicalExternalSourceReference} from './ingestionContract.js';
+import {
+  canonicalExternalSourceReference,
+  encodeSourceAccountReference,
+  SOURCE_ACCOUNT_IDENTITY_DOMAINS
+} from './ingestionContract.js';
 import {canonicalTransactionFromLegacy, deterministicAllocationId} from '../services/allocationService.js';
 import {initializeStateRevision} from '../services/stateRevision.js';
 
@@ -108,6 +112,25 @@ function assertValidMigrationState(state, phase) {
     });
     if (!validation.ok) throw new Error(`${phase} state failed foundation validation: ${validation.errors.join('; ')}`);
   }
+}
+
+function assertNoAmbiguousCandidateAccountIdentity(state) {
+  if (sourceVersion(state) !== 10) return;
+  const collections = [
+    state.domain?.accounts,
+    state.domain?.transactions,
+    state.domain?.sourceQuarantines,
+    state.domain?.sourceTombstones
+  ];
+  const ambiguous = collections.some(collection => Array.isArray(collection)
+    && collection.some(item => item.sourceKind === 'csv' && !item.sourceAccountIdentityDomain));
+  if (!ambiguous) return;
+  const error = new Error(
+    'Schema-10 CSV account identity from an unreleased candidate lacks required domain provenance; controlled remediation is required.'
+  );
+  error.name = 'CandidateAccountIdentityMigrationError';
+  error.code = 'CSV_LEGACY_ACCOUNT_IDENTITY_DOMAIN_UNRESOLVED';
+  throw error;
 }
 
 function toCents(value) {
@@ -392,6 +415,22 @@ function migratedSourceReference(source, preferred) {
   return source === 'csv' ? canonicalExternalSourceReference(preferred) : preferred;
 }
 
+function migratedAccountIdentity(source, preferred, localAccountId, uniquePreferred) {
+  if (uniquePreferred) {
+    const domain = source === 'csv'
+      ? SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL
+      : SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT;
+    return {
+      sourceAccountRef:encodeSourceAccountReference(domain, preferred),
+      sourceAccountIdentityDomain:domain
+    };
+  }
+  return {
+    sourceAccountRef:encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.MIGRATED_LOCAL, localAccountId),
+    sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.MIGRATED_LOCAL
+  };
+}
+
 function sourceDateFromTransaction(transaction) {
   for (const value of [transaction.displayDate, transaction.postedAt, transaction.authorizedAt]) {
     if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return value.slice(0, 10);
@@ -422,15 +461,16 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const sourceNamespace = account.id === UNKNOWN_ACCOUNT_ID ? 'manual:vault' : providerNeutralNamespace(source);
     const preferred = existingReference(account.externalAccountId);
     const countKey = `${sourceKind}|${sourceNamespace}|${preferred}`;
-    const sourceAccountRef = account.id === UNKNOWN_ACCOUNT_ID
-      ? 'unknown-account'
-      : (preferred && accountPreferredRefs.get(countKey) === 1
-        ? migratedSourceReference(source, preferred)
-        : `account:${account.id}`);
+    const accountIdentity = account.id === UNKNOWN_ACCOUNT_ID
+      ? {
+        sourceAccountRef:encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN),
+        sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN
+      }
+      : migratedAccountIdentity(source, preferred, account.id, Boolean(preferred && accountPreferredRefs.get(countKey) === 1));
     Object.assign(account, {
       sourceKind,
       sourceNamespace,
-      sourceAccountRef,
+      ...accountIdentity,
       connectionId:null,
       institutionName:account.institutionName ?? null,
       providerDisplayName:account.providerDisplayName ?? account.officialName ?? null,
@@ -478,6 +518,7 @@ function initializeProviderNeutralIngestion(state, {now}) {
       sourceNamespace,
       sourceRecordRef,
       sourceAccountRef:account?.sourceAccountRef || 'unknown-account',
+      sourceAccountIdentityDomain:account?.sourceAccountIdentityDomain || SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN,
       sourceLifecycle:transaction.pendingStatus || 'unknown',
       sourceAmount:{
         decimal:formatSignedCents(transaction.amountCents),
@@ -947,6 +988,7 @@ export function migrateState(input, {now} = {}) {
   if (fromVersion > STATE_SCHEMA_VERSION) {
     throw new Error(`Vault schema ${fromVersion} is newer than supported schema ${STATE_SCHEMA_VERSION}.`);
   }
+  assertNoAmbiguousCandidateAccountIdentity(state);
   assertValidMigrationState(state, 'Pre-migration');
   const applied = [];
   let version = fromVersion;

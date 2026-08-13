@@ -1,14 +1,29 @@
 import {normalizeCurrency, parseExactUsdAmount} from '../domain/exactMoney.js';
+import {encodeSourceAccountReference, SOURCE_ACCOUNT_IDENTITY_DOMAINS} from '../domain/ingestionContract.js';
 import {finishAdapterBatch, normalizedAccount, normalizedTransaction, quarantineRecord} from './adapterUtils.js';
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function manualAccountIdentity(value) {
+  const raw = text(value);
+  if (!raw) return {sourceAccountRef:null, sourceAccountIdentityDomain:null};
+  if (raw === 'unknown-account') return {
+    sourceAccountRef:encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN),
+    sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN
+  };
+  return {
+    sourceAccountRef:encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT, raw),
+    sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT
+  };
+}
+
 function quarantineFromManual(item, producedAt, reason, safeDetailCode) {
+  const accountIdentity = manualAccountIdentity(item.sourceAccountRef);
   return quarantineRecord({
     sourceRecordRef:text(item.sourceRecordRef) || 'invalid-manual-record',
-    sourceAccountRef:text(item.sourceAccountRef) || null,
+    ...accountIdentity,
     observedAt:item.observedAt || producedAt,
     reason,
     rawAmountDecimal:typeof item.amountDecimal === 'string' ? item.amountDecimal : null,
@@ -24,22 +39,26 @@ export async function createManualMutationBatch({
   accounts = [],
   transactions = []
 }) {
-  const accountMutations = accounts.map(item => ({
-    kind:item.kind ?? 'add',
-    sourceAccountRef:item.sourceAccountRef,
-    observedAt:item.observedAt ?? producedAt,
-    account:(item.kind ?? 'add') === 'disconnect' ? null : normalizedAccount(item.account)
-  }));
+  const accountMutations = accounts.map(item => {
+    const accountIdentity = manualAccountIdentity(item.sourceAccountRef);
+    return {
+      kind:item.kind ?? 'add',
+      ...accountIdentity,
+      observedAt:item.observedAt ?? producedAt,
+      account:(item.kind ?? 'add') === 'disconnect' ? null : normalizedAccount(item.account)
+    };
+  });
   const transactionMutations = [];
   const quarantinedRecords = [];
 
   for (const item of transactions) {
     const kind = item.kind ?? 'add';
+    const accountIdentity = manualAccountIdentity(item.sourceAccountRef);
     if (kind === 'remove') {
       transactionMutations.push({
         kind,
         sourceRecordRef:item.sourceRecordRef,
-        sourceAccountRef:item.sourceAccountRef,
+        ...accountIdentity,
         observedAt:item.observedAt ?? producedAt,
         record:null,
         removal:{reason:item.removalReason ?? 'source_removed', predecessorOfRef:item.predecessorOfRef ?? null}
@@ -79,7 +98,7 @@ export async function createManualMutationBatch({
     transactionMutations.push({
       kind,
       sourceRecordRef:item.sourceRecordRef,
-      sourceAccountRef:item.sourceAccountRef,
+      ...accountIdentity,
       observedAt:item.observedAt ?? producedAt,
       record:normalizedTransaction({
         ...item,

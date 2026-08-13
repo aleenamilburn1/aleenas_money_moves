@@ -89,11 +89,21 @@ export function normalizedTransaction(input) {
 export function quarantineRecord({
   sourceRecordRef,
   sourceAccountRef = null,
+  sourceAccountIdentityDomain = null,
   observedAt,
   reason,
   rawAmountDecimal = null,
   sourceCurrency = null,
   safeDetailCode
 }) {
-  return {sourceRecordRef, sourceAccountRef, observedAt, reason, rawAmountDecimal, sourceCurrency, safeDetailCode};
+  return {
+    sourceRecordRef,
+    sourceAccountRef,
+    sourceAccountIdentityDomain,
+    observedAt,
+    reason,
+    rawAmountDecimal,
+    sourceCurrency,
+    safeDetailCode
+  };
 }
