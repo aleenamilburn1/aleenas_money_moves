@@ -1,5 +1,5 @@
 import {normalizeCurrency, parseExactUsdAmount} from '../domain/exactMoney.js';
-import {sha256Text, stableCanonicalJson} from '../domain/ingestionContract.js';
+import {canonicalExternalSourceReference, sha256Text, stableCanonicalJson} from '../domain/ingestionContract.js';
 import {parseCsv} from '../csv.js';
 import {finishAdapterBatch, normalizedAccount, normalizedTransaction, quarantineRecord} from './adapterUtils.js';
 
@@ -103,7 +103,7 @@ function accountMappingIndex(accountMappings) {
 
 function sourceAccountReference(row, profile, mappings) {
   const external = firstValue(row, profile.accountIdColumns);
-  if (external) return `external:${external}`;
+  if (external) return canonicalExternalSourceReference(external);
   const label = firstValue(row, profile.accountColumns);
   const mapped = mappings.get(normalizedMappingLabel(label));
   return mapped || null;
@@ -215,7 +215,7 @@ export async function createCsvMutationBatch({
 
   for (const {row, line, sourceAccountRef} of resolvedRows) {
     const externalRef = firstValue(row, profile.transactionIdColumns);
-    const sourceRecordRef = externalRef ? `external:${externalRef}` : `file:${fileDigest}:row:${line}`;
+    const sourceRecordRef = externalRef ? canonicalExternalSourceReference(externalRef) : `file:${fileDigest}:row:${line}`;
     const observedAt = producedAt;
     const amountInput = sourceAmountInput(row, profile);
     const currencyText = firstValue(row, profile.currencyColumns) || (profile.currencyGuaranteed ? profile.currency : '');

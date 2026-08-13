@@ -2,6 +2,7 @@ import {PRODUCT_NAME, STARTER_SPENDING_BUCKETS, STATE_SCHEMA_VERSION, SYSTEM_BUC
 import {FAITH_MONEY_DEVOTIONALS} from '../content/faithMoneyDevotionals.js';
 import {createUnknownAccount, validateAuditEvent, validateDomainStore, validateBucket} from './models.js';
 import {formatSignedCents} from './exactMoney.js';
+import {canonicalExternalSourceReference} from './ingestionContract.js';
 import {canonicalTransactionFromLegacy, deterministicAllocationId} from '../services/allocationService.js';
 import {initializeStateRevision} from '../services/stateRevision.js';
 
@@ -387,6 +388,10 @@ function existingReference(value) {
   return candidate || null;
 }
 
+function migratedSourceReference(source, preferred) {
+  return source === 'csv' ? canonicalExternalSourceReference(preferred) : preferred;
+}
+
 function sourceDateFromTransaction(transaction) {
   for (const value of [transaction.displayDate, transaction.postedAt, transaction.authorizedAt]) {
     if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return value.slice(0, 10);
@@ -419,7 +424,9 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const countKey = `${sourceKind}|${sourceNamespace}|${preferred}`;
     const sourceAccountRef = account.id === UNKNOWN_ACCOUNT_ID
       ? 'unknown-account'
-      : (preferred && accountPreferredRefs.get(countKey) === 1 ? preferred : `account:${account.id}`);
+      : (preferred && accountPreferredRefs.get(countKey) === 1
+        ? migratedSourceReference(source, preferred)
+        : `account:${account.id}`);
     Object.assign(account, {
       sourceKind,
       sourceNamespace,
@@ -459,7 +466,9 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const preferred = existingReference(transaction.sourceTransactionId);
     const account = accountById.get(transaction.accountId);
     const key = `${sourceKind}|${sourceNamespace}|${account?.sourceAccountRef || 'unknown-account'}|${preferred}`;
-    const sourceRecordRef = preferred && transactionPreferredRefs.get(key) === 1 ? preferred : `transaction:${transaction.id}`;
+    const sourceRecordRef = preferred && transactionPreferredRefs.get(key) === 1
+      ? migratedSourceReference(transaction.source, preferred)
+      : `transaction:${transaction.id}`;
     const sourceDate = sourceDateFromTransaction(transaction);
     const providerCategoryMetadata = transaction.providerCategory
       ? {primary:String(transaction.providerCategory), detailed:null, confidence:null, taxonomyVersion:null}

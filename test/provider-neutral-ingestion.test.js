@@ -7,7 +7,7 @@ import {createManualMutationBatch} from '../js/adapters/manualIngestionAdapter.j
 import {STATE_SCHEMA_VERSION, SYSTEM_BUCKET_IDS} from '../js/domain/constants.js';
 import {ExactMoneyError, parseExactUsdAmount} from '../js/domain/exactMoney.js';
 import {
-  computeBatchDigest, computeLegacyEnvelopeDigest, finalizeMutationBatch, validateSourceMutationBatch
+  canonicalExternalSourceReference, computeBatchDigest, computeLegacyEnvelopeDigest, finalizeMutationBatch, validateSourceMutationBatch
 } from '../js/domain/ingestionContract.js';
 import {migrateState, validateFoundationDomain} from '../js/domain/migrations.js';
 import {validateDomainStore} from '../js/domain/models.js';
@@ -156,6 +156,81 @@ test('exact money parsing covers zero, signs, cents, safe maximum, overflow, pre
     ['NaN', 'INVALID_DECIMAL'],
     ['1,000.00', 'INVALID_DECIMAL']
   ]) assert.throws(() => parseExactUsdAmount(value), error => error instanceof ExactMoneyError && error.code === code);
+});
+
+test('raw external source references use one opaque collision-free canonical encoding', async t => {
+  const cases = [
+    ['ordinary', 'stable-account', 'external:stable-account'],
+    ['punctuation', 'acct:/?#[]@!$&\'()*+,;=', 'external:acct:/?#[]@!$&\'()*+,;='],
+    ['internal whitespace', 'account  two', 'external:account  two'],
+    ['Unicode', '账户-Å-💵', 'external:账户-Å-💵'],
+    ['colon', 'bank:checking:1234', 'external:bank:checking:1234'],
+    ['prefix-looking raw value', 'external:stable-account', 'external:external:stable-account'],
+    ['long valid value', 'x'.repeat(247), `external:${'x'.repeat(247)}`]
+  ];
+  for (const [name, raw, expected] of cases) await t.test(name, () => {
+    assert.equal(canonicalExternalSourceReference(raw), expected);
+  });
+  assert.notEqual(canonicalExternalSourceReference('foo'), canonicalExternalSourceReference('external:foo'));
+  assert.notEqual(canonicalExternalSourceReference('CaseSensitive'), canonicalExternalSourceReference('casesensitive'));
+  assert.notEqual(canonicalExternalSourceReference('é'), canonicalExternalSourceReference('é'));
+  assert.throws(() => canonicalExternalSourceReference('x'.repeat(248)), error => error.code === 'INVALID_RAW_EXTERNAL_REFERENCE');
+  assert.throws(() => canonicalExternalSourceReference('bad\u0000id'), error => error.code === 'INVALID_RAW_EXTERNAL_REFERENCE');
+});
+
+test('schema-9 migration and CSV ingestion encode opaque external account and transaction IDs identically', async t => {
+  const rawIds = [
+    'stable-id', 'punctuation-._~:/?#[]@!$&\'()*+', 'internal  whitespace', '账户-Å-💵',
+    'external:prefix-looking', 'CaseSensitive', 'casesensitive', 'x'.repeat(247)
+  ];
+  const observedRefs = new Set();
+  for (const [index, rawId] of rawIds.entries()) await t.test(`opaque ID ${index + 1}`, async () => {
+    const schema9 = toSchema9(freshState());
+    const accountId = `edge-account-${index}`;
+    const transactionId = `edge-transaction-${index}`;
+    schema9.domain.accounts.push({
+      id:accountId, institutionId:null, externalAccountId:rawId, friendlyName:'Edge', officialName:'Edge', mask:null,
+      type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+      createdAt:V3A_NOW, updatedAt:V3A_NOW
+    });
+    schema9.domain.transactions.push({
+      id:transactionId, accountId, source:'csv', sourceTransactionId:rawId, rawName:null, merchantName:null,
+      amountCents:-100, currency:'USD', authorizedAt:null, postedAt:'2026-08-01', displayDate:'2026-08-01',
+      pendingStatus:'posted', movementType:'unclassified', reviewStatus:'pending', locationRegion:null,
+      locationCountry:null, locationSource:null, providerCategory:null, manualOverrides:null,
+      createdAt:V3A_NOW, updatedAt:V3A_NOW
+    });
+    const migrated = migrateState(schema9, {now:V3A_NOW}).state;
+    const batch = await createCsvMutationBatch({
+      rows:[{date:'2026-08-01', amount:'1.00', account_name:'Edge', account_id:rawId, transaction_id:rawId}],
+      producedAt:V3A_NOW,
+      sourceNamespace:'csv:legacy',
+      profile:{id:`edge-${index}`}
+    });
+    const migratedAccount = migrated.domain.accounts.find(item => item.id === accountId);
+    const migratedTransaction = migrated.domain.transactions.find(item => item.id === transactionId);
+    assert.equal(migratedAccount.sourceAccountRef, batch.accountMutations[0].sourceAccountRef);
+    assert.equal(migratedTransaction.sourceRecordRef, batch.transactionMutations[0].sourceRecordRef);
+    observedRefs.add(`${migratedAccount.sourceAccountRef}\u001f${migratedTransaction.sourceRecordRef}`);
+  });
+  assert.equal(observedRefs.size, rawIds.length);
+});
+
+test('explicit external IDs remain separate from deterministic CSV fallback references', async () => {
+  const profile = {id:'fallback-domain-separation', accountMappings:{Checking:'mapped:checking'}};
+  const explicit = await createCsvMutationBatch({
+    rows:[{date:'2026-08-01', amount:'1.00', account:'Checking', transaction_id:'file:pretend:row:2'}],
+    producedAt:V3A_NOW,
+    profile
+  });
+  const fallback = await createCsvMutationBatch({
+    csvText:'date,amount,account\n2026-08-01,1.00,Checking',
+    producedAt:V3A_NOW,
+    profile
+  });
+  assert.equal(explicit.transactionMutations[0].sourceRecordRef, 'external:file:pretend:row:2');
+  assert.match(fallback.transactionMutations[0].sourceRecordRef, /^file:[a-f0-9]{64}:row:2$/);
+  assert.notEqual(explicit.transactionMutations[0].sourceRecordRef, fallback.transactionMutations[0].sourceRecordRef);
 });
 
 test('every supported source sign mapping produces Money Moves positive-inflow and negative-outflow cents', () => {
@@ -1036,6 +1111,66 @@ test('unreleased schema-10 label identities require remediation without reinterp
   assert.deepEqual(applied.state, before);
 });
 
+test('unreleased schema-10 pre-canonical migrated external references fail closed instead of duplicating identities', async () => {
+  const schema9 = toSchema9(freshState());
+  schema9.domain.accounts.push({
+    id:'candidate-account', institutionId:null, externalAccountId:'stable-account', friendlyName:'Checking', officialName:'Checking',
+    mask:null, type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+  schema9.domain.transactions.push({
+    id:'candidate-transaction', accountId:'candidate-account', source:'csv', sourceTransactionId:'external:stable-tx',
+    rawName:'Coffee', merchantName:'Coffee', amountCents:-1000, currency:'USD', authorizedAt:null, postedAt:'2026-08-01',
+    displayDate:'2026-08-01', pendingStatus:'posted', movementType:'unclassified', reviewStatus:'pending',
+    locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null, manualOverrides:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+  const candidateState = migrateState(schema9, {now:V3A_NOW}).state;
+  const account = candidateState.domain.accounts.find(item => item.id === 'candidate-account');
+  const transaction = candidateState.domain.transactions.find(item => item.id === 'candidate-transaction');
+  account.sourceAccountRef = 'stable-account';
+  transaction.sourceAccountRef = 'stable-account';
+  transaction.sourceRecordRef = 'external:stable-tx';
+  transaction.sourceTransactionId = 'external:stable-tx';
+  assert.equal(validateDomainStore(candidateState.domain).ok, true);
+  const before = structuredClone(candidateState);
+  const batch = await createCsvMutationBatch({
+    csvText:'date,description,amount,account,account_id,transaction_id\n2026-08-01,Coffee,10.00,Checking,stable-account,external:stable-tx',
+    producedAt:V3A_NOW,
+    profile:{id:'legacy'}
+  });
+  await assert.rejects(
+    () => reconcileMutationBatch(candidateState, batch, {idFactory:ids(), now:V3A_NOW}),
+    error => error.code === 'CSV_LEGACY_EXTERNAL_REFERENCE_UNRESOLVED'
+  );
+  assert.deepEqual(candidateState, before);
+});
+
+test('unreleased account-only schema-10 external reference ambiguity fails closed', async () => {
+  const candidateState = freshState();
+  candidateState.domain.accounts.push({
+    id:'candidate-account-only', institutionId:null, externalAccountId:'stable-account', friendlyName:'Checking', officialName:'Checking',
+    mask:null, type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    sourceKind:'csv', sourceNamespace:'csv:account-only', sourceAccountRef:'stable-account', connectionId:null,
+    institutionName:null, providerDisplayName:'Checking', enabled:true, hidden:false, sourceStatus:'active',
+    connectionStatus:'not_applicable', sourceMetadata:{}, balances:null, sourceObservedAt:V3A_NOW,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+  assert.equal(validateDomainStore(candidateState.domain).ok, true);
+  const before = structuredClone(candidateState);
+  const batch = await createCsvMutationBatch({
+    rows:[{date:'2026-08-01', amount:'1.00', account:'Checking', account_id:'stable-account', transaction_id:'stable-tx'}],
+    producedAt:V3A_NOW,
+    sourceNamespace:'csv:account-only',
+    profile:{id:'account-only'}
+  });
+  await assert.rejects(
+    () => reconcileMutationBatch(candidateState, batch, {idFactory:ids(), now:V3A_NOW}),
+    error => error.code === 'CSV_LEGACY_EXTERNAL_REFERENCE_UNRESOLVED'
+  );
+  assert.deepEqual(candidateState, before);
+});
+
 test('encrypted backup restore preserves mapped account identity and stable CSV reimport', async () => {
   const csv = [
     'date,description,amount,account,institution,mask,transaction_id,currency',
@@ -1642,8 +1777,8 @@ test('schema 9 to 10 migration is deterministic for empty/populated vaults and p
   assert.deepEqual(first.applied, ['v3a-provider-neutral-ingestion']);
   assert.equal(first.state.schemaVersion, 10);
   assert.equal(first.state.domain.accounts.find(item => item.id === account.id).friendlyName, 'Friendly stays');
-  assert.equal(first.state.domain.transactions.find(item => item.id === transaction.id).sourceRecordRef, 'csv-transaction-id');
-  assert.equal(first.state.domain.transactions.find(item => item.id === secondTransaction.id).sourceRecordRef, 'csv-transaction-id');
+  assert.equal(first.state.domain.transactions.find(item => item.id === transaction.id).sourceRecordRef, 'external:csv-transaction-id');
+  assert.equal(first.state.domain.transactions.find(item => item.id === secondTransaction.id).sourceRecordRef, 'external:csv-transaction-id');
   assert.notEqual(
     first.state.domain.transactions.find(item => item.id === transaction.id).sourceAccountRef,
     first.state.domain.transactions.find(item => item.id === secondTransaction.id).sourceAccountRef
@@ -1654,6 +1789,180 @@ test('schema 9 to 10 migration is deterministic for empty/populated vaults and p
   assert.equal(first.state.domain.devotionalState.activeDevotionalId, schema9.domain.devotionalState.activeDevotionalId);
   assert.equal(validateFoundationDomain(first.state.domain).ok, true);
   assert.deepEqual(migrateState(first.state, {now:V3A_NOW}).state, first.state);
+});
+
+test('schema 9 CSV identities survive migration and identical adapter reimport without duplicate canonical entities', async () => {
+  const schema9 = toSchema9(freshState());
+  const account = {
+    id:'legacy-stable-account', institutionId:null, externalAccountId:'stable-account', friendlyName:'Checking', officialName:'Checking',
+    mask:'1234', type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  const transaction = {
+    id:'legacy-stable-transaction', accountId:account.id, source:'csv', sourceTransactionId:'stable-tx',
+    rawName:'Coffee', merchantName:'Coffee', amountCents:-1000, currency:'USD', authorizedAt:null, postedAt:'2026-08-01',
+    displayDate:'2026-08-01', pendingStatus:'posted', movementType:'expense', reviewStatus:'reviewed',
+    locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null, manualOverrides:{merchantName:'User Coffee'},
+    userNote:'Keep this note',
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  schema9.domain.accounts.push(account);
+  schema9.domain.transactions.push(transaction);
+  const bucket = schema9.domain.buckets.find(item => !item.system && item.parentId === null);
+  schema9.domain.allocations.push({
+    id:'legacy-stable-allocation', transactionId:transaction.id, bucketId:bucket.id, subBucketId:null, amountCents:1000,
+    ownershipType:'mine', note:'Keep this allocation', reimbursementClaimId:null, createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+
+  const migrated = migrateState(schema9, {now:V3A_NOW}).state;
+  const migratedAccount = migrated.domain.accounts.find(item => item.id === account.id);
+  const migratedTransaction = migrated.domain.transactions.find(item => item.id === transaction.id);
+
+  const batch = await createCsvMutationBatch({
+    csvText:'date,description,amount,account_name,account_id,transaction_id,mask,account_type,account_subtype\n2026-08-01,Coffee,10.00,Checking,stable-account,stable-tx,1234,depository,checking',
+    producedAt:V3A_NOW,
+    profile:{id:'legacy'}
+  });
+  const beforeCounts = {accounts:migrated.domain.accounts.length, transactions:migrated.domain.transactions.length};
+  const reapplied = await reconcileMutationBatch(migrated, batch, {idFactory:ids(), now:V3A_NOW});
+
+  assert.equal(reapplied.result.counts.transactionsAdded, 0);
+  assert.equal(reapplied.result.counts.accountsAdded, 0);
+  assert.equal(migratedAccount.sourceAccountRef, 'external:stable-account');
+  assert.equal(migratedTransaction.sourceRecordRef, 'external:stable-tx');
+  assert.equal(reapplied.state.domain.accounts.length, beforeCounts.accounts);
+  assert.equal(reapplied.state.domain.transactions.length, beforeCounts.transactions);
+  assert.equal(reapplied.state.domain.accounts.find(item => item.sourceAccountRef === 'external:stable-account').id, account.id);
+  const retained = reapplied.state.domain.transactions.find(item => item.sourceRecordRef === 'external:stable-tx');
+  assert.equal(retained.id, transaction.id);
+  assert.equal(retained.movementType, 'expense');
+  assert.equal(retained.reviewStatus, 'reviewed');
+  assert.deepEqual(retained.manualOverrides, {merchantName:'User Coffee'});
+  assert.equal(retained.userNote, 'Keep this note');
+  assert.equal(retained.interpretationConflictId, null);
+  assert.equal(reapplied.result.counts.interpretationConflicts, 0);
+  assert.equal(reapplied.state.domain.allocations.find(item => item.id === 'legacy-stable-allocation').status, 'active');
+  assert.equal(reapplied.state.domain.allocations.find(item => item.id === 'legacy-stable-allocation').transactionId, transaction.id);
+  const firstHistoryLength = retained.sourceHistory.length;
+  const replay = await reconcileMutationBatch(reapplied.state, batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(replay.changed, false);
+  assert.equal(replay.state.domain.transactions.find(item => item.id === transaction.id).sourceHistory.length, firstHistoryLength);
+
+  const changedAmount = structuredClone(batch);
+  changedAmount.batchId = 'changed-migrated-add';
+  changedAmount.transactionMutations[0].record.amountCents = -1100;
+  changedAmount.transactionMutations[0].record.sourceAmount.decimal = '11.00';
+  changedAmount.payloadDigest = '';
+  const finalizedChangedAmount = await finalizeMutationBatch(changedAmount);
+  const beforeChangedAmount = structuredClone(migrated);
+  await assert.rejects(
+    () => reconcileMutationBatch(migrated, finalizedChangedAmount, {idFactory:ids(), now:V3A_NOW}),
+    error => error.code === 'TRANSACTION_ADD_CONFLICT'
+  );
+  assert.deepEqual(migrated, beforeChangedAmount);
+});
+
+test('populated schema-9 CSV variants preserve multi-account, lifecycle, and manual history on reimport', async () => {
+  const schema9 = toSchema9(freshState());
+  const accountA = {
+    id:'migration-account-a', institutionId:null, externalAccountId:'bank-a', friendlyName:'A', officialName:'A', mask:'1111',
+    type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  const accountB = {...accountA, id:'migration-account-b', externalAccountId:'bank-b', friendlyName:'B', officialName:'B', mask:'2222'};
+  const transaction = (id, accountId, sourceTransactionId, pendingStatus, date) => ({
+    id, accountId, source:'csv', sourceTransactionId, rawName:null, merchantName:null, amountCents:-100,
+    currency:'USD', authorizedAt:null, postedAt:date, displayDate:date, pendingStatus,
+    movementType:'unclassified', reviewStatus:'pending', locationRegion:null, locationCountry:null,
+    locationSource:null, providerCategory:null, manualOverrides:null, createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+  const csvTransactions = [
+    transaction('migration-tx-a-shared', accountA.id, 'shared-tx', 'posted', '2026-08-01'),
+    transaction('migration-tx-b-shared', accountB.id, 'shared-tx', 'posted', '2026-08-02'),
+    transaction('migration-tx-pending', accountA.id, 'pending-tx', 'pending', '2026-08-03'),
+    transaction('migration-tx-removed', accountA.id, 'removed-tx', 'removed', '2026-08-04')
+  ];
+  const manualAccount = {...accountA, id:'migration-manual-account', externalAccountId:'manual-account-ref', source:'manual', friendlyName:'Manual'};
+  const manualTransaction = {
+    ...transaction('migration-manual-tx', manualAccount.id, 'manual-tx-ref', 'posted', '2026-08-05'),
+    source:'manual'
+  };
+  schema9.domain.accounts.push(accountA, accountB, manualAccount);
+  schema9.domain.transactions.push(...csvTransactions, manualTransaction);
+
+  const migrated = migrateState(schema9, {now:V3A_NOW}).state;
+  const batch = await createCsvMutationBatch({
+    rows:[
+      {date:'2026-08-01', amount:'1.00', account_name:'A', account_id:'bank-a', transaction_id:'shared-tx', mask:'1111'},
+      {date:'2026-08-02', amount:'1.00', account_name:'B', account_id:'bank-b', transaction_id:'shared-tx', mask:'2222'},
+      {date:'2026-08-04', amount:'1.00', account_name:'A', account_id:'bank-a', transaction_id:'removed-tx', mask:'1111'}
+    ],
+    producedAt:V3A_NOW,
+    sourceNamespace:'csv:legacy',
+    profile:{id:'legacy'}
+  });
+  const result = await reconcileMutationBatch(migrated, batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(result.result.counts.accountsAdded, 0);
+  assert.equal(result.result.counts.transactionsAdded, 0);
+  assert.equal(result.state.domain.accounts.filter(item => item.sourceKind === 'csv' && item.sourceNamespace === 'csv:legacy').length, 2);
+  assert.equal(result.state.domain.transactions.filter(item => item.sourceKind === 'csv' && item.sourceNamespace === 'csv:legacy').length, 4);
+  assert.deepEqual(
+    result.state.domain.transactions.filter(item => item.sourceRecordRef === 'external:shared-tx').map(item => item.id).sort(),
+    ['migration-tx-a-shared', 'migration-tx-b-shared']
+  );
+  assert.equal(result.state.domain.transactions.find(item => item.id === 'migration-tx-pending').sourceLifecycle, 'pending');
+  assert.equal(result.state.domain.transactions.find(item => item.id === 'migration-tx-removed').sourceLifecycle, 'posted');
+  assert.equal(result.state.domain.accounts.find(item => item.id === manualAccount.id).sourceAccountRef, 'manual-account-ref');
+  assert.equal(result.state.domain.transactions.find(item => item.id === manualTransaction.id).sourceRecordRef, 'manual-tx-ref');
+  assert.equal(validateDomainStore(result.state.domain).ok, true);
+});
+
+test('schema-9 migration backup and restore retains canonical CSV identity for later identical reimport', async () => {
+  const schema9 = toSchema9(freshState());
+  const account = {
+    id:'restore-migrated-account', institutionId:null, externalAccountId:'restore-account', friendlyName:'Restore', officialName:'Restore',
+    mask:null, type:'depository', subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  const transaction = {
+    id:'restore-migrated-transaction', accountId:account.id, source:'csv', sourceTransactionId:'restore-tx',
+    rawName:'Restored purchase', merchantName:'Restored purchase', amountCents:-250, currency:'USD', authorizedAt:null,
+    postedAt:'2026-08-06', displayDate:'2026-08-06', pendingStatus:'posted', movementType:'expense', reviewStatus:'reviewed',
+    locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null, manualOverrides:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  schema9.domain.accounts.push(account);
+  schema9.domain.transactions.push(transaction);
+  const bucket = schema9.domain.buckets.find(item => !item.system && item.parentId === null);
+  schema9.domain.allocations.push({
+    id:'restore-migrated-allocation', transactionId:transaction.id, bucketId:bucket.id, subBucketId:null, amountCents:250,
+    ownershipType:'mine', note:null, reimbursementClaimId:null, createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+  const migrated = migrateState(schema9, {now:V3A_NOW}).state;
+  const repository = createVaultRepository();
+  const service = createStateService({repository, seed:freshState()});
+  const passphrase = 'correct horse battery staple';
+  const created = await service.create(passphrase, migrated);
+  const backup = await service.exportEncryptedBackup();
+  const changed = structuredClone(created.state);
+  changed.preferences.monthlyIncome = 321;
+  const saved = await service.save(changed, created.key, created.meta, {expectedVaultGeneration:created.vaultGeneration});
+  const restored = await service.restore(backup, passphrase, {expectedVaultGeneration:saved.vaultGeneration});
+  const batch = await createCsvMutationBatch({
+    csvText:'date,description,amount,account,account_id,transaction_id\n2026-08-06,Restored purchase,2.50,Restore,restore-account,restore-tx',
+    producedAt:V3A_NOW,
+    profile:{id:'legacy'}
+  });
+  const reapplied = await reconcileMutationBatch(restored.state, batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(reapplied.result.counts.accountsAdded, 0);
+  assert.equal(reapplied.result.counts.transactionsAdded, 0);
+  assert.equal(reapplied.state.domain.accounts.find(item => item.sourceAccountRef === 'external:restore-account').id, account.id);
+  const retained = reapplied.state.domain.transactions.find(item => item.sourceRecordRef === 'external:restore-tx');
+  assert.equal(retained.id, transaction.id);
+  assert.equal(retained.movementType, 'expense');
+  assert.equal(retained.reviewStatus, 'reviewed');
+  assert.equal(retained.interpretationConflictId, null);
+  assert.equal(reapplied.state.domain.allocations.find(item => item.id === 'restore-migrated-allocation').transactionId, transaction.id);
 });
 
 test('schema 9 to 10 migration never derives CSV account identity from duplicate display labels', () => {
@@ -1690,8 +1999,8 @@ test('schema 9 to 10 migration never derives CSV account identity from duplicate
     ['account:legacy-csv-same-label-a', 'account:legacy-csv-same-label-b']
   );
   assert.notEqual(transactions[0].sourceAccountRef, transactions[1].sourceAccountRef);
-  assert.equal(transactions[0].sourceRecordRef, 'shared-external-id');
-  assert.equal(transactions[1].sourceRecordRef, 'shared-external-id');
+  assert.equal(transactions[0].sourceRecordRef, 'external:shared-external-id');
+  assert.equal(transactions[1].sourceRecordRef, 'external:shared-external-id');
   assert.equal(validateDomainStore(migrated.domain).ok, true);
 });
 

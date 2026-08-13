@@ -39,6 +39,25 @@ export class IngestionContractError extends Error {
   }
 }
 
+export function canonicalExternalSourceReference(rawExternalId) {
+  const raw = typeof rawExternalId === 'string' ? rawExternalId.trim() : '';
+  const canonical = `external:${raw}`;
+  const errors = [];
+  if (!raw) errors.push('rawExternalId must be a non-empty string');
+  if (canonical.length > INGESTION_LIMITS.refChars) {
+    errors.push(`canonical external source reference exceeds ${INGESTION_LIMITS.refChars} characters`);
+  }
+  if (CONTROL_PATTERN.test(canonical)) errors.push('rawExternalId contains control characters');
+  if (errors.length) {
+    throw new IngestionContractError(
+      'INVALID_RAW_EXTERNAL_REFERENCE',
+      'The raw external identifier cannot be represented as a canonical source reference.',
+      errors
+    );
+  }
+  return canonical;
+}
+
 function contractError(code, errors) {
   throw new IngestionContractError(code, `The ingestion batch is invalid (${code}).`, errors);
 }

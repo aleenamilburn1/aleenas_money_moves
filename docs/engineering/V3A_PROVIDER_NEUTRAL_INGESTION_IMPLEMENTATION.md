@@ -1,13 +1,14 @@
 # Money Moves V3A — Provider-Neutral Ingestion Implementation
 
-Date: 2026-08-12
-Status: CANDIDATES 1–3 REJECTED; CSV ACCOUNT-IDENTITY REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
+Date: 2026-08-13
+Status: CANDIDATES 1–4 REJECTED; SCHEMA-9 / CSV SOURCE-REFERENCE REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
 Domain schema: 10
 Trusted parent: `5d2c44925931292724bc4a2d62cfade3c969f606` (`v3-plaid-architecture-accepted`)
 Rejected Candidate 1: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
 Rejected Candidate 2: `c2adfaca8411b2bdc9a050097452021e79928fcb` (`v3a-provider-neutral-ingestion-candidate-2`)
 Rejected Candidate 3: `dce5bb2c812fef1332e3c81153f93a68de0a6871` (`v3a-provider-neutral-ingestion-candidate-3`)
-Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-4`
+Rejected Candidate 4: `72f21872d70504db5d11f79ec18c3d53e94c42da` (`v3a-provider-neutral-ingestion-candidate-4`)
+Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-5`
 
 ## Outcome and scope
 
@@ -67,6 +68,14 @@ row, passes saved mappings from the existing import settings, and refuses to
 reinterpret persisted unreleased `label:` identities. It does not add an import
 mapping UI or broaden V3A scope.
 
+Independent acceptance rejected Candidate 4 after reproducing a schema-9
+continuity blocker. Migration copied explicit CSV account and transaction IDs
+as raw `stable-account` / `stable-tx`, while the adapter encoded the same raw
+IDs as `external:stable-account` / `external:stable-tx`. Identical reimport
+therefore created one duplicate account and one duplicate transaction.
+Candidate 5 fixes only this raw-versus-canonical source-reference mismatch and
+its direct migration, candidate-state, atomicity, and backup/restore surface.
+
 ## Requirements affected
 
 The implementation follows the PRD's provider-metadata, traceability,
@@ -121,6 +130,15 @@ other V1/V2 data remain unchanged. Existing manual and CSV records receive
 deterministic provider-neutral source identities. Records without a trustworthy
 external reference reuse their stable local ID; the migration does not invent a
 provider connection, account mask, location, merchant, or reimbursement.
+
+Candidate 5 routes raw CSV external account and transaction IDs through the
+same `canonicalExternalSourceReference` contract function used by CSV
+ingestion. A raw ID is opaque after contract-approved outer trimming: no case,
+Unicode, punctuation, colon, or internal-whitespace normalization occurs. Raw
+`foo` becomes `external:foo`; raw `external:foo` becomes
+`external:external:foo`, so prefix-looking raw data cannot collapse with
+already-canonical data. Deterministic `file:<digest>:row:<line>` fallbacks and
+explicit saved-mapping references remain separate reference domains.
 
 The schema-9→10 migration never uses account display metadata as identity. A
 unique legacy external account ID remains authoritative; otherwise the stable
@@ -393,9 +411,16 @@ and these three engineering documents. It adds no schema migration, dependency,
 backend, network path, credential, provider product, FX behavior, Reports UI,
 or build artifact.
 
+Candidate 5 changes only `js/domain/ingestionContract.js`,
+`js/domain/migrations.js`, `js/adapters/csvIngestionAdapter.js`,
+`js/services/ingestionService.js`, `test/provider-neutral-ingestion.test.js`,
+and these three engineering documents. It adds no schema version, migration
+step, dependency, UI, backend, network path, credential, provider product, FX
+behavior, Reports UI, or build artifact.
+
 ## Tests and fixtures
 
-The 91 focused V3A checks use only synthetic manual, CSV, and fixture-provider
+The 114 focused V3A checks use only synthetic manual, CSV, and fixture-provider
 values.
 They cover exact cents and sign matrices; malformed, huge, zero, missing,
 invalid, and foreign-currency values; closed contract limits; account and
@@ -425,17 +450,27 @@ failure plus mapped retry, unreleased schema-10 `label:` refusal, schema-9
 duplicate-label migration, encrypted restore/reimport, and corrected-identity
 Candidate-1 receipt proof.
 
-Full remediation validation records 322 unit tests and 38 Electron-focused tests,
+Candidate 5 adds the independently reproduced schema-9→10→identical-CSV path;
+shared account/transaction encoding; punctuation, internal whitespace, Unicode,
+colon, prefix-looking, long, and case-sensitive IDs; fallback-domain separation;
+multiple accounts with the same transaction ID; allocated/classified/reviewed
+identity preservation; pending, removed, and manual-history preservation;
+changed-add fail-closed atomicity; unreleased pre-canonical schema-10 refusal;
+and encrypted migration backup/restore followed by zero-duplicate reimport.
+
+Full remediation validation records 345 unit tests, 114 focused V3A tests, and
+38 Electron-focused tests,
 all passing with zero failures, skips, or todos. No dependency was added.
 
 ## Schema decision
 
-The schema remains 10. Candidate 4 changes adapter resolution and reconciliation
-policy, not persisted entity shape. Schema 9→10 identity generation is already
-safe: it uses a unique external reference or a stable local account ID, never a
-display label.
+The schema remains 10. Candidate 5 corrects the not-yet-accepted schema-9→10
+conversion and adapter boundary before V3A release; it changes no persisted
+entity shape. A unique CSV external reference is encoded through the shared
+contract function, while records without one still use a stable local account
+or transaction ID and never a display label.
 
-Candidates 1–3 could nevertheless have written unreleased schema-10 vaults with
+Candidates 1–4 could nevertheless have written unreleased schema-10 vaults with
 unsafe `label:` source-account refs. Those refs may be present on accounts,
 transactions, quarantines, tombstones, receipt digests, and related audit or
 conflict history. Two real accounts may already have been collapsed, so no
@@ -445,6 +480,14 @@ batch or same-namespace persisted evidence containing a `label:` ref returns
 `CSV_LEGACY_ACCOUNT_IDENTITY_UNRESOLVED` before replay or mutation. Candidates
 1–3 were never accepted or released; explicit controlled remediation of any
 internal candidate vault is safer than silently guessing account boundaries.
+
+Candidate 4 development vaults can also contain either raw unprefixed refs from
+schema-9 migration or canonical prefixed refs from native CSV ingestion. Native
+prefixed refs remain valid. A same-namespace import that matches an unprefixed
+schema-9 candidate identity after exactly one raw-to-canonical conversion fails
+closed with `CSV_LEGACY_EXTERNAL_REFERENCE_UNRESOLVED`; arbitrary raw and
+canonical strings are never silently equated. No schema 11 was introduced
+because no V3A schema 10 candidate was accepted or released.
 
 Candidate 3's legacy receipt proof remains unchanged for explicit or corrected
 mapped identities. Malformed, missing-effect, wrong-account, wrong-reference,
@@ -462,13 +505,17 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Known limitations
 
-- Candidates 1–3 were rejected; Candidate 4 awaits independent re-acceptance.
+- Candidates 1–4 were rejected; Candidate 5 awaits independent re-acceptance.
 - There is no dedicated account-mapping UI in V3A. CSVs without stable account
   IDs require an existing saved mapping; same-label distinct accounts require
   distinct source IDs or a future richer explicit mapping workflow.
 - Unreleased schema-10 `label:` histories cannot be repaired automatically and
   intentionally block same-namespace CSV ingestion pending controlled
   remediation.
+- Unreleased schema-10 raw migrated external references are detected only by a
+  deterministic same-namespace account/transaction match and fail closed for
+  controlled remediation; Candidate 5 does not guess or rewrite candidate
+  history.
 - A structurally valid Candidate-1 receipt is insufficient by itself. Legacy
   replay fails closed when schema-10 state cannot independently prove its
   effects, including genuinely empty legacy batches and account-source changes
@@ -486,8 +533,8 @@ interpretation continue to persist only through the existing encrypted vault.
 ## Recommended next task
 
 Run an independent V3A re-acceptance review from
-`v3a-provider-neutral-ingestion-candidate-4`. Re-read the
+`v3a-provider-neutral-ingestion-candidate-5`. Re-read the
 five authoritative V3 documents, audit schema-9 migration and field ownership,
-repeat the 322-unit/38-Electron validation gate, add adversarial cases if any
+repeat the 345-unit/114-focused/38-Electron validation gate, add adversarial cases if any
 gap is found, and issue a separate acceptance or rejection record. Do not begin
 V3B from this implementation report alone.

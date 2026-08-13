@@ -1,5 +1,7 @@
 import {STATE_SCHEMA_VERSION, UNKNOWN_ACCOUNT_ID} from '../domain/constants.js';
-import {computeLegacyEnvelopeDigest, stableCanonicalJson, validateSourceMutationBatch} from '../domain/ingestionContract.js';
+import {
+  canonicalExternalSourceReference, computeLegacyEnvelopeDigest, stableCanonicalJson, validateSourceMutationBatch
+} from '../domain/ingestionContract.js';
 import {
   INGESTION_RESULT_COUNT_FIELDS, isAllocationActive, validateDomainStore, validateIngestionReceipt
 } from '../domain/models.js';
@@ -219,6 +221,38 @@ function assertNoUnresolvedLegacyCsvAccountIdentity(domain, batch) {
       'This CSV import profile has unresolved account identity from an unreleased ingestion candidate. Use controlled account remediation before retrying.'
     );
   }
+  const preCanonicalMigrationMatch = (domain?.transactions || []).some(transaction => {
+    if (transaction.sourceKind !== 'csv' || transaction.sourceNamespace !== batch.sourceNamespace
+      || transaction.sourceProvenance?.migratedFromSchema !== 9) return false;
+    let canonicalAccountRef;
+    let canonicalRecordRef;
+    try {
+      canonicalAccountRef = canonicalExternalSourceReference(transaction.sourceAccountRef);
+      canonicalRecordRef = canonicalExternalSourceReference(transaction.sourceRecordRef);
+    } catch {
+      return false;
+    }
+    return batch.transactionMutations.some(mutation => mutation.sourceAccountRef === canonicalAccountRef
+      && mutation.sourceRecordRef === canonicalRecordRef);
+  });
+  const accountOnlyPreCanonicalMatch = (domain?.accounts || []).some(account => {
+    if (account.sourceKind !== 'csv' || account.sourceNamespace !== batch.sourceNamespace) return false;
+    const hasTransactionEvidence = (domain?.transactions || []).some(transaction => transaction.accountId === account.id);
+    if (hasTransactionEvidence) return false;
+    let canonicalAccountRef;
+    try {
+      canonicalAccountRef = canonicalExternalSourceReference(account.sourceAccountRef);
+    } catch {
+      return false;
+    }
+    return batch.accountMutations.some(mutation => mutation.sourceAccountRef === canonicalAccountRef);
+  });
+  if (preCanonicalMigrationMatch || accountOnlyPreCanonicalMatch) {
+    fail(
+      'CSV_LEGACY_EXTERNAL_REFERENCE_UNRESOLVED',
+      'This CSV import matches pre-canonical external references from an unreleased ingestion candidate. Use controlled source-reference remediation before retrying.'
+    );
+  }
 }
 
 function resolveLocalAccount(domain, batch, sourceAccountRef, index) {
@@ -274,6 +308,14 @@ function transactionCurrentFacts(transaction) {
 
 function sourceFactsEqual(transaction, record) {
   return stableCanonicalJson(transactionCurrentFacts(transaction)) === stableCanonicalJson(recordSourceFacts(record));
+}
+
+function migratedSourceCompletionIsCompatible(transaction, record) {
+  return transaction.sourceProvenance?.migratedFromSchema === 9
+    && transaction.sourceLifecycle === record.lifecycle
+    && transaction.amountCents === record.amountCents
+    && transaction.currency === record.currency
+    && transaction.sourceDate === record.sourceDate;
 }
 
 function historySnapshot(transaction, batch, observedAt) {
@@ -492,6 +534,13 @@ function applyOrdinaryTransactionMutations(state, domain, batch, context, accoun
         applyRecordToTransaction(domain, existing, mutation, batch, context, counts);
         existing.sourceLifecycle = mutation.record.lifecycle;
         existing.pendingStatus = mutation.record.lifecycle;
+        syncLegacyReviewProjection(state, existing, account);
+      } else if (migratedSourceCompletionIsCompatible(existing, mutation.record)) {
+        // Schema 9 retained canonical money and user interpretation but could
+        // not retain every adapter-specific source snapshot field. The first
+        // exact-key observation may complete those source facts as a bounded
+        // migration reconciliation without replacing local identity or user work.
+        applyRecordToTransaction(domain, existing, mutation, batch, context, counts);
         syncLegacyReviewProjection(state, existing, account);
       } else if (!sourceFactsEqual(existing, mutation.record)) {
         fail('TRANSACTION_ADD_CONFLICT', 'A transaction add conflicts with existing source facts.');
