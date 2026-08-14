@@ -3,7 +3,11 @@ import {
   DEVOTIONAL_RESPONSE_MAX_CHARS, SYSTEM_BUCKET_IDS, UNKNOWN_ACCOUNT_ID
 } from './constants.js';
 import {FAITH_MONEY_DEVOTIONALS, devotionalById} from '../content/faithMoneyDevotionals.js';
-import {SOURCE_ACCOUNT_IDENTITY_DOMAINS, sourceAccountReferenceMatchesDomain} from './ingestionContract.js';
+import {
+  INGESTION_LIMITS,
+  SOURCE_ACCOUNT_IDENTITY_DOMAINS,
+  sourceAccountReferenceMatchesDomain
+} from './ingestionContract.js';
 
 export const ACCOUNT_TYPES = new Set(['cash', 'depository', 'credit', 'loan', 'savings', 'investment', 'other', 'unknown']);
 export const TRANSACTION_SOURCES = new Set(['manual', 'csv', 'migration', 'provider']);
@@ -38,6 +42,7 @@ export const INGESTION_RESULT_COUNT_FIELDS = Object.freeze([
 ]);
 
 const SHA256_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const IDENTITY_CONTROL_PATTERN = /[\u0000-\u001f\u007f]/;
 
 const SYSTEM_BUCKET_SEMANTICS = Object.freeze({
   [SYSTEM_BUCKET_IDS.income]:'income',
@@ -58,8 +63,20 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function identityTuple(...values) {
+  return JSON.stringify(values);
+}
+
 function requiredString(value, field, errors) {
   if (typeof value !== 'string' || !value.trim()) errors.push(`${field} must be a non-empty string`);
+}
+
+function requiredOpaqueIdentityString(value, field, errors) {
+  if (typeof value !== 'string' || value === '') errors.push(`${field} must be a non-empty string`);
+  else {
+    if (value.length > INGESTION_LIMITS.refChars) errors.push(`${field} exceeds ${INGESTION_LIMITS.refChars} characters`);
+    if (IDENTITY_CONTROL_PATTERN.test(value)) errors.push(`${field} contains control characters`);
+  }
 }
 
 function optionalString(value, field, errors) {
@@ -219,7 +236,7 @@ export function validateTransaction(value) {
   if (Object.prototype.hasOwnProperty.call(value, 'sourceKind')) {
     requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
     requiredString(value.sourceNamespace, 'sourceNamespace', errors);
-    requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
+    requiredOpaqueIdentityString(value.sourceRecordRef, 'sourceRecordRef', errors);
     requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
     requiredEnum(value.sourceAccountIdentityDomain, 'sourceAccountIdentityDomain', SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, errors);
     if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
@@ -246,7 +263,7 @@ export function validateTransaction(value) {
     if (!Array.isArray(value.sourceRefAliases)) errors.push('sourceRefAliases must be an array');
     else for (const alias of value.sourceRefAliases) {
       if (!isPlainObject(alias)) { errors.push('sourceRefAliases must contain objects'); continue; }
-      requiredString(alias.sourceRecordRef, 'sourceRefAliases.sourceRecordRef', errors);
+      requiredOpaqueIdentityString(alias.sourceRecordRef, 'sourceRefAliases.sourceRecordRef', errors);
       requiredString(alias.lifecycle, 'sourceRefAliases.lifecycle', errors);
       requiredTimestamp(alias.observedAt, 'sourceRefAliases.observedAt', errors);
     }
@@ -258,7 +275,7 @@ export function validateTransaction(value) {
       if (!isPlainObject(history)) { errors.push('sourceHistory must contain objects'); continue; }
       requiredTimestamp(history.observedAt, 'sourceHistory.observedAt', errors);
       requiredString(history.batchId, 'sourceHistory.batchId', errors);
-      requiredString(history.sourceRecordRef, 'sourceHistory.sourceRecordRef', errors);
+      requiredOpaqueIdentityString(history.sourceRecordRef, 'sourceHistory.sourceRecordRef', errors);
     }
   }
   return validationResult('Transaction', value, errors);
@@ -601,7 +618,7 @@ function validateSourceQuarantine(value) {
   requiredString(value.batchId, 'batchId', errors);
   requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
   requiredString(value.sourceNamespace, 'sourceNamespace', errors);
-  requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
+  requiredOpaqueIdentityString(value.sourceRecordRef, 'sourceRecordRef', errors);
   optionalString(value.sourceAccountRef, 'sourceAccountRef', errors);
   if (value.sourceAccountRef === null) {
     if (value.sourceAccountIdentityDomain !== null) errors.push('sourceAccountIdentityDomain must be null without sourceAccountRef');
@@ -627,7 +644,7 @@ function validateSourceTombstone(value) {
   requiredString(value.batchId, 'batchId', errors);
   requiredEnum(value.sourceKind, 'sourceKind', SOURCE_KINDS, errors);
   requiredString(value.sourceNamespace, 'sourceNamespace', errors);
-  requiredString(value.sourceRecordRef, 'sourceRecordRef', errors);
+  requiredOpaqueIdentityString(value.sourceRecordRef, 'sourceRecordRef', errors);
   requiredString(value.sourceAccountRef, 'sourceAccountRef', errors);
   requiredEnum(value.sourceAccountIdentityDomain, 'sourceAccountIdentityDomain', SOURCE_ACCOUNT_IDENTITY_DOMAIN_SET, errors);
   if (!sourceAccountReferenceMatchesDomain(value.sourceAccountIdentityDomain, value.sourceAccountRef)) {
@@ -780,7 +797,7 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
   const accountSourceKeys = new Map();
   for (const account of domain.accounts) {
     if (!account.sourceKind) continue;
-    const key = `${account.sourceKind}|${account.sourceNamespace}|${account.sourceAccountRef}`;
+    const key = identityTuple(account.sourceKind, account.sourceNamespace, account.sourceAccountRef);
     if (accountSourceKeys.has(key)) errors.push(`account ${account.id} duplicates source identity used by ${accountSourceKeys.get(key)}`);
     else accountSourceKeys.set(key, account.id);
   }
@@ -798,7 +815,12 @@ function validateBaseRelationships(domain, errors, {legacySemanticType = false} 
       || sourceAccount.sourceAccountIdentityDomain !== transaction.sourceAccountIdentityDomain
     )) errors.push(`transaction ${transaction.id} source-account identity does not match account ${sourceAccount.id}`);
     for (const reference of [transaction.sourceRecordRef, ...(transaction.sourceRefAliases || []).map(alias => alias.sourceRecordRef)]) {
-      const key = `${transaction.sourceKind}|${transaction.sourceNamespace}|${transaction.sourceAccountRef}|${reference}`;
+      const key = identityTuple(
+        transaction.sourceKind,
+        transaction.sourceNamespace,
+        transaction.sourceAccountRef,
+        reference
+      );
       if (transactionSourceKeys.has(key) && transactionSourceKeys.get(key) !== transaction.id) {
         errors.push(`transaction ${transaction.id} duplicates source identity used by ${transactionSourceKeys.get(key)}`);
       } else transactionSourceKeys.set(key, transaction.id);

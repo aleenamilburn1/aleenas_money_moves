@@ -12,6 +12,7 @@ import {
   computeLegacyEnvelopeDigest,
   encodeSourceAccountReference,
   finalizeMutationBatch,
+  INGESTION_LIMITS,
   SOURCE_ACCOUNT_IDENTITY_DOMAINS,
   validateSourceMutationBatch
 } from '../js/domain/ingestionContract.js';
@@ -174,6 +175,9 @@ test('raw external source references use one opaque collision-free canonical enc
     ['Unicode', '账户-Å-💵', 'external:账户-Å-💵'],
     ['colon', 'bank:checking:1234', 'external:bank:checking:1234'],
     ['prefix-looking raw value', 'external:stable-account', 'external:external:stable-account'],
+    ['leading ASCII space', ' stable-account', 'external: stable-account'],
+    ['trailing ASCII space', 'stable-account ', 'external:stable-account '],
+    ['NBSP boundary', '\u00a0stable-account', 'external:\u00a0stable-account'],
     ['long valid value', 'x'.repeat(247), `external:${'x'.repeat(247)}`]
   ];
   for (const [name, raw, expected] of cases) await t.test(name, () => {
@@ -186,7 +190,7 @@ test('raw external source references use one opaque collision-free canonical enc
   assert.throws(() => canonicalExternalSourceReference('bad\u0000id'), error => error.code === 'INVALID_RAW_EXTERNAL_REFERENCE');
 });
 
-test('source-account reference encoding is injective within and across every encoded identity domain', () => {
+test('source-account reference encoding is deterministic and injective within and across every encoded identity domain', () => {
   const domains = [
     SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL,
     SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING,
@@ -196,14 +200,22 @@ test('source-account reference encoding is injective within and across every enc
   const payloads = [
     'foo', 'external:foo', 'mapping:foo', 'mapped:foo', 'file:x', 'external:external:foo',
     'a:b', ':', '账户-Å-💵', 'punctuation-._~:/?#[]@!$&\'()*+,;=', 'CaseSensitive',
-    'casesensitive', 'internal  whitespace', 'é', 'é'
+    'casesensitive', 'internal  whitespace', 'é', 'é', ' foo', 'foo ', ' foo ',
+    '\u00a0foo', 'foo\u00a0', '\u2003foo', 'foo\u2003', 'a/b', 'a\\b', 'a||b', '   ', '\u00a0'
   ];
+  assert.equal(new Set(payloads).size, payloads.length);
   const encoded = new Map();
+  const allReferences = new Set();
   for (const domain of domains) {
     const references = payloads.map(payload => encodeSourceAccountReference(domain, payload));
     assert.equal(new Set(references).size, payloads.length, `${domain} must be injective`);
+    for (const [index, payload] of payloads.entries()) {
+      assert.equal(encodeSourceAccountReference(domain, payload), references[index], `${domain} must be deterministic`);
+      allReferences.add(references[index]);
+    }
     encoded.set(domain, references);
   }
+  assert.equal(allReferences.size, domains.length * payloads.length, 'all domain/payload pairs must be disjoint');
   for (let leftIndex = 0; leftIndex < domains.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < domains.length; rightIndex += 1) {
       const left = new Set(encoded.get(domains[leftIndex]));
@@ -222,20 +234,33 @@ test('source-account reference encoding is injective within and across every enc
     domains.some(domain => encoded.get(domain).includes('unknown-account')),
     false
   );
-  assert.equal(
-    encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING, 'x'.repeat(248)).length,
-    256
-  );
-  assert.throws(
-    () => encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING, 'x'.repeat(249)),
-    error => error.code === 'INVALID_SOURCE_ACCOUNT_REFERENCE'
-  );
+  const prefixes = new Map([
+    [SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL, 'external:'],
+    [SOURCE_ACCOUNT_IDENTITY_DOMAINS.MAPPING, 'mapping:'],
+    [SOURCE_ACCOUNT_IDENTITY_DOMAINS.MIGRATED_LOCAL, 'account:'],
+    [SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT, 'direct:']
+  ]);
+  for (const domain of domains) {
+    const maximumPayloadLength = INGESTION_LIMITS.refChars - prefixes.get(domain).length;
+    const boundary = ` ${'x'.repeat(maximumPayloadLength - 1)}`;
+    assert.equal(encodeSourceAccountReference(domain, boundary).length, INGESTION_LIMITS.refChars);
+    assert.throws(
+      () => encodeSourceAccountReference(domain, `${boundary}x`),
+      error => error.code === 'INVALID_SOURCE_ACCOUNT_REFERENCE'
+    );
+  }
+  assert.notEqual(canonicalExternalSourceReference('foo'), canonicalExternalSourceReference(' foo'));
+  assert.notEqual(canonicalExternalSourceReference('foo'), canonicalExternalSourceReference('foo '));
+  assert.notEqual(canonicalExternalSourceReference('foo'), canonicalExternalSourceReference('\u00a0foo'));
+  assert.throws(() => canonicalExternalSourceReference(''), error => error.code === 'INVALID_RAW_EXTERNAL_REFERENCE');
+  assert.throws(() => canonicalExternalSourceReference('\tfoo'), error => error.code === 'INVALID_RAW_EXTERNAL_REFERENCE');
 });
 
 test('schema-9 migration and CSV ingestion encode opaque external account and transaction IDs identically', async t => {
   const rawIds = [
     'stable-id', 'punctuation-._~:/?#[]@!$&\'()*+', 'internal  whitespace', '账户-Å-💵',
-    'external:prefix-looking', 'CaseSensitive', 'casesensitive', 'x'.repeat(247)
+    'external:prefix-looking', 'CaseSensitive', 'casesensitive', ' foo', 'foo ', '\u00a0foo',
+    'a|external:b', 'x'.repeat(247)
   ];
   const observedRefs = new Set();
   for (const [index, rawId] of rawIds.entries()) await t.test(`opaque ID ${index + 1}`, async () => {
@@ -324,6 +349,45 @@ test('manual adapter emits active USD records and deterministic unsafe, missing,
   assert.equal(applied.state.domain.transactions.length, 2);
   assert.equal(applied.state.domain.sourceQuarantines.length, 7);
   assert.equal(applied.result.counts.sourceRecordsQuarantined, 7);
+});
+
+test('manual and fixture adapters preserve exact direct account identity payloads', async () => {
+  const manual = await createManualMutationBatch({
+    batchId:'manual-exact-account-identity',
+    producedAt:V3A_NOW,
+    accounts:[{sourceAccountRef:' direct-account ', account:{officialName:'Cash', currency:'USD', type:'cash'}}],
+    transactions:[
+      {
+        sourceRecordRef:' direct-transaction ', sourceAccountRef:' direct-account ', amountDecimal:'1.00',
+        currency:'USD', direction:'outflow', sourceDate:'2026-08-01'
+      },
+      {
+        sourceRecordRef:' ', sourceAccountRef:' direct-account ', amountDecimal:'2.00',
+        currency:'USD', direction:'outflow', sourceDate:'2026-08-02'
+      }
+    ]
+  });
+  assert.equal(manual.accountMutations[0].sourceAccountRef, 'direct: direct-account ');
+  assert.equal(manual.transactionMutations[0].sourceAccountRef, 'direct: direct-account ');
+  assert.equal(manual.transactionMutations[0].sourceRecordRef, ' direct-transaction ');
+  assert.equal(manual.transactionMutations[1].sourceRecordRef, ' ');
+  const manualApplied = await reconcileMutationBatch(freshState(), manual, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(manualApplied.result.counts.accountsAdded, 1);
+  assert.equal(manualApplied.result.counts.transactionsAdded, 2);
+
+  const fixture = await createFixtureMutationBatch({
+    batchId:'fixture-exact-account-identity',
+    producedAt:V3A_NOW,
+    sourceNamespace:'fixture:exact-identity',
+    accountMutations:[fixtureAccountMutation(' fixture-account ')],
+    transactionMutations:[fixtureTransactionMutation('fixture-exact-record', {sourceAccountRef:' fixture-account '})]
+  });
+  assert.equal(fixture.accountMutations[0].sourceAccountRef, 'direct: fixture-account ');
+  assert.equal(fixture.transactionMutations[0].sourceAccountRef, 'direct: fixture-account ');
+  assert.throws(
+    () => encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.DIRECT, '\tinvalid'),
+    error => error.code === 'INVALID_SOURCE_ACCOUNT_REFERENCE'
+  );
 });
 
 test('closed batch validation rejects unknown fields, sensitive metadata, duplicate terminal refs, invalid digest, and oversized strings without mutation', async () => {
@@ -788,6 +852,41 @@ test('a same-key source revival reuses the local transaction and resolves only i
   assert.equal(revived.state.domain.interpretationConflicts[0].status, 'resolved');
 });
 
+test('tombstone and revival keep boundary-distinct account identities isolated', async () => {
+  const initial = await fixtureBatch({
+    batchId:'boundary-revival-base',
+    accountMutations:[fixtureAccountMutation('foo'), fixtureAccountMutation('foo ')],
+    transactionMutations:[
+      fixtureTransactionMutation('shared-boundary-record', {sourceAccountRef:'foo'}),
+      fixtureTransactionMutation('shared-boundary-record', {sourceAccountRef:'foo '})
+    ]
+  });
+  const applied = await reconcileMutationBatch(freshState(), initial, {idFactory:ids(), now:V3A_NOW});
+  const original = applied.state.domain.transactions.find(item => item.sourceAccountRef === 'direct:foo ');
+  const removal = await fixtureBatch({
+    batchId:'boundary-revival-remove',
+    accountMutations:[],
+    transactionMutations:[fixtureTransactionMutation('shared-boundary-record', {sourceAccountRef:'foo ', kind:'remove'})]
+  });
+  const removed = await reconcileMutationBatch(applied.state, removal, {
+    idFactory:ids(), now:'2026-08-11T17:00:00.000Z'
+  });
+  assert.equal(removed.state.domain.transactions.find(item => item.sourceAccountRef === 'direct:foo ').sourceLifecycle, 'removed');
+  assert.equal(removed.state.domain.transactions.find(item => item.sourceAccountRef === 'direct:foo').sourceLifecycle, 'posted');
+  const revival = await fixtureBatch({
+    batchId:'boundary-revival-add',
+    accountMutations:[],
+    transactionMutations:[fixtureTransactionMutation('shared-boundary-record', {sourceAccountRef:'foo '})]
+  });
+  const revived = await reconcileMutationBatch(removed.state, revival, {
+    idFactory:ids(), now:'2026-08-11T18:00:00.000Z'
+  });
+  const current = revived.state.domain.transactions.find(item => item.sourceAccountRef === 'direct:foo ');
+  assert.equal(current.id, original.id);
+  assert.equal(current.sourceLifecycle, 'posted');
+  assert.equal(revived.state.domain.transactions.find(item => item.sourceAccountRef === 'direct:foo').sourceLifecycle, 'posted');
+});
+
 test('a later non-USD observation quarantines exact evidence and excludes an existing active source record without FX', async () => {
   const initial = await createManualMutationBatch({
     batchId:'manual-usd-initial', producedAt:V3A_NOW,
@@ -885,6 +984,115 @@ test('CSV external and saved-mapping account identity domains cannot collapse', 
   for (const transaction of transactions) {
     assert.equal(accounts.find(item => item.sourceAccountRef === transaction.sourceAccountRef)?.id, transaction.accountId);
   }
+});
+
+test('CSV preserves leading, trailing, and NBSP account identity boundaries end to end and on replay', async () => {
+  const csvText = [
+    'date,description,amount,account,account_id,transaction_id',
+    '2026-08-01,Plain,1.00,Checking,foo,shared-boundary-tx',
+    '2026-08-02,Leading,2.00,Checking," foo",shared-boundary-tx',
+    '2026-08-03,Trailing,3.00,Checking,"foo ",shared-boundary-tx',
+    '2026-08-04,NBSP,4.00,Checking,\u00a0foo,shared-boundary-tx'
+  ].join('\n');
+  const profile = {id:'candidate-7-whitespace-boundaries', signProfile:'positive_outflow'};
+  const batch = await createCsvMutationBatch({csvText, producedAt:V3A_NOW, profile});
+  const expectedRefs = ['external:foo', 'external: foo', 'external:foo ', 'external:\u00a0foo'];
+  assert.deepEqual(batch.accountMutations.map(item => item.sourceAccountRef).sort(), expectedRefs.sort());
+  assert.equal(batch.accountMutations.length, 4);
+  assert.equal(batch.transactionMutations.length, 4);
+  assert.equal(new Set(batch.transactionMutations.map(item => item.sourceRecordRef)).size, 1);
+
+  const applied = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  const accounts = applied.state.domain.accounts.filter(item => item.sourceKind === 'csv');
+  const transactions = applied.state.domain.transactions.filter(item => item.sourceKind === 'csv');
+  assert.equal(applied.result.counts.accountsAdded, 4);
+  assert.equal(applied.result.counts.transactionsAdded, 4);
+  assert.equal(accounts.length, 4);
+  assert.equal(transactions.length, 4);
+  assert.equal(new Set(transactions.map(item => item.accountId)).size, 4);
+  for (const transaction of transactions) {
+    assert.equal(accounts.find(item => item.sourceAccountRef === transaction.sourceAccountRef)?.id, transaction.accountId);
+  }
+
+  const later = await createCsvMutationBatch({
+    csvText,
+    producedAt:'2026-08-13T16:00:00.000Z',
+    profile
+  });
+  const replay = await reconcileMutationBatch(applied.state, later, {
+    idFactory:ids(), now:'2026-08-13T16:00:00.000Z'
+  });
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.changed, false);
+  assert.equal(replay.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 4);
+  assert.equal(replay.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 4);
+});
+
+test('saved mapping identity payload boundaries stay exact while lookup labels remain normalized', async () => {
+  const batch = await createCsvMutationBatch({
+    rows:[
+      {date:'2026-08-01', amount:'1.00', account:' PLAIN ', transaction_id:'mapping-boundary-a'},
+      {date:'2026-08-02', amount:'2.00', account:'LEADING', transaction_id:'mapping-boundary-b'},
+      {date:'2026-08-03', amount:'3.00', account:'trailing', transaction_id:'mapping-boundary-c'},
+      {date:'2026-08-04', amount:'4.00', account:'nbsp', transaction_id:'mapping-boundary-d'}
+    ],
+    producedAt:V3A_NOW,
+    profile:{
+      id:'candidate-7-mapping-boundaries',
+      accountMappings:{Plain:'foo', Leading:' foo', Trailing:'foo ', NBSP:'\u00a0foo'}
+    }
+  });
+  assert.deepEqual(
+    batch.accountMutations.map(item => item.sourceAccountRef).sort(),
+    ['mapping:foo', 'mapping: foo', 'mapping:foo ', 'mapping:\u00a0foo'].sort()
+  );
+  const applied = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(applied.result.counts.accountsAdded, 4);
+  assert.equal(new Set(applied.state.domain.transactions.filter(item => item.sourceKind === 'csv')
+    .map(item => item.accountId)).size, 4);
+});
+
+test('external and mapping identities remain disjoint when opaque payloads contain boundary whitespace', async () => {
+  const batch = await createCsvMutationBatch({
+    rows:[
+      {date:'2026-08-01', amount:'1.00', account:'Explicit', account_id:'foo', transaction_id:'cross-space-a'},
+      {date:'2026-08-02', amount:'2.00', account:' mapped ', transaction_id:'cross-space-b'}
+    ],
+    producedAt:V3A_NOW,
+    profile:{id:'candidate-7-cross-domain-space', accountMappings:{Mapped:' foo'}}
+  });
+  assert.deepEqual(
+    batch.accountMutations.map(item => item.sourceAccountRef).sort(),
+    ['external:foo', 'mapping: foo'].sort()
+  );
+  const applied = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(applied.result.counts.accountsAdded, 2);
+  assert.equal(applied.result.counts.transactionsAdded, 2);
+  assert.equal(new Set(applied.state.domain.transactions.filter(item => item.sourceKind === 'csv')
+    .map(item => item.accountId)).size, 2);
+});
+
+test('collision-free tuple keys preserve delimiter-looking account and transaction identities', async () => {
+  const batch = await createCsvMutationBatch({
+    rows:[
+      {
+        date:'2026-08-01', amount:'1.00', account:'First', account_id:'a|external:b',
+        transaction_id:'c'
+      },
+      {
+        date:'2026-08-02', amount:'2.00', account:'Second', account_id:'a',
+        transaction_id:'b|external:c'
+      }
+    ],
+    producedAt:V3A_NOW,
+    profile:{id:'candidate-7-delimiter-tuples'}
+  });
+  const applied = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(applied.result.counts.accountsAdded, 2);
+  assert.equal(applied.result.counts.transactionsAdded, 2);
+  assert.equal(validateDomainStore(applied.state.domain).ok, true);
+  assert.equal(new Set(applied.state.domain.transactions.filter(item => item.sourceKind === 'csv')
+    .map(item => item.accountId)).size, 2);
 });
 
 test('CSV external and mapping collision matrix preserves grouping, metadata, and transaction assignment', async () => {
@@ -1302,6 +1510,41 @@ test('mixed external, mapped, and unresolved CSV batch is atomic and corrected r
   assert.deepEqual(created.state, beforeState);
   assert.equal(await service.exportEncryptedBackup(), beforeBackup);
 
+  const invalidBoundaryRows = [
+    {date:'2026-08-01', amount:'1.00', account_id:'valid-external', account:'Explicit', transaction_id:'atomic-boundary-a'},
+    {date:'2026-08-02', amount:'2.00', account_id:'', account:'Mapped', transaction_id:'atomic-boundary-b'},
+    {date:'2026-08-03', amount:'3.00', account_id:'invalid\tidentity', account:'Invalid', transaction_id:'atomic-boundary-c'}
+  ];
+  await assert.rejects(
+    () => createCsvMutationBatch({
+      rows:invalidBoundaryRows,
+      producedAt:V3A_NOW,
+      profile:{id:'atomic-invalid-identity-boundary', accountMappings:{Mapped:' mapped '}}
+    }),
+    error => error.code === 'INVALID_RAW_EXTERNAL_REFERENCE'
+  );
+  assert.deepEqual(created.state, beforeState);
+  assert.equal(await service.exportEncryptedBackup(), beforeBackup);
+
+  const correctedBoundary = await createCsvMutationBatch({
+    rows:invalidBoundaryRows.map(row => row.account_id === 'invalid\tidentity' ? {...row, account_id:'valid identity'} : row),
+    producedAt:V3A_NOW,
+    profile:{id:'atomic-invalid-identity-boundary', accountMappings:{Mapped:' mapped '}}
+  });
+  let persistedBoundaryState = null;
+  const boundaryApplied = await applyMutationBatchAtomically(
+    freshState(),
+    correctedBoundary,
+    async nextState => {
+      persistedBoundaryState = structuredClone(nextState);
+      return {saved:true};
+    },
+    {idFactory:ids(), now:V3A_NOW}
+  );
+  assert.equal(boundaryApplied.result.counts.accountsAdded, 3);
+  assert.equal(boundaryApplied.result.counts.transactionsAdded, 3);
+  assert.deepEqual(persistedBoundaryState, boundaryApplied.state);
+
   const corrected = await createCsvMutationBatch({
     csvText:csv,
     producedAt:'2026-08-12T16:00:00.000Z',
@@ -1549,6 +1792,66 @@ test('encrypted backup restore preserves collision-looking external and mapping 
   assert.deepEqual(replay.state.review.importSettings.accountMappings, profile.accountMappings);
 });
 
+test('encrypted backup restore preserves exact whitespace identities, domains, mappings, assignments, and replay', async () => {
+  const csvText = [
+    'date,description,amount,account,account_id,transaction_id',
+    '2026-08-01,Plain,1.00,Checking,foo,backup-shared-tx',
+    '2026-08-02,Leading,2.00,Checking," foo",backup-shared-tx',
+    '2026-08-03,Mapped,3.00,Mapped,,backup-shared-tx'
+  ].join('\n');
+  const profile = {
+    id:'candidate-7-backup-whitespace',
+    signProfile:'positive_outflow',
+    accountMappings:{Mapped:'foo '}
+  };
+  const batch = await createCsvMutationBatch({csvText, producedAt:V3A_NOW, profile});
+  const imported = await reconcileMutationBatch(freshState(), batch, {idFactory:ids(), now:V3A_NOW});
+  imported.state.review.importSettings.accountMappings = structuredClone(profile.accountMappings);
+  const expectedAccounts = new Map(imported.state.domain.accounts.filter(item => item.sourceKind === 'csv')
+    .map(item => [item.sourceAccountRef, {id:item.id, domain:item.sourceAccountIdentityDomain}]));
+  const expectedAssignments = imported.state.domain.transactions.filter(item => item.sourceKind === 'csv')
+    .map(item => ({id:item.id, accountId:item.accountId, sourceAccountRef:item.sourceAccountRef}));
+
+  const repository = createVaultRepository();
+  const service = createStateService({repository, seed:freshState()});
+  const passphrase = 'candidate seven exact backup';
+  const created = await service.create(passphrase, imported.state);
+  const backup = await service.exportEncryptedBackup();
+  const changed = structuredClone(created.state);
+  changed.preferences.monthlyIncome = 789;
+  const saved = await service.save(changed, created.key, created.meta, {
+    expectedVaultGeneration:created.vaultGeneration
+  });
+  const restored = await service.restore(backup, passphrase, {expectedVaultGeneration:saved.vaultGeneration});
+  const restoredAccounts = restored.state.domain.accounts.filter(item => item.sourceKind === 'csv');
+  assert.deepEqual(
+    restoredAccounts.map(item => item.sourceAccountRef).sort(),
+    ['external:foo', 'external: foo', 'mapping:foo '].sort()
+  );
+  for (const account of restoredAccounts) {
+    assert.equal(account.id, expectedAccounts.get(account.sourceAccountRef)?.id);
+    assert.equal(account.sourceAccountIdentityDomain, expectedAccounts.get(account.sourceAccountRef)?.domain);
+  }
+  for (const expected of expectedAssignments) {
+    const transaction = restored.state.domain.transactions.find(item => item.id === expected.id);
+    assert.equal(transaction.accountId, expected.accountId);
+    assert.equal(transaction.sourceAccountRef, expected.sourceAccountRef);
+  }
+  assert.deepEqual(restored.state.review.importSettings.accountMappings, profile.accountMappings);
+
+  const later = await createCsvMutationBatch({
+    csvText,
+    producedAt:'2026-08-13T16:00:00.000Z',
+    profile
+  });
+  const replay = await reconcileMutationBatch(restored.state, later, {
+    idFactory:ids(), now:'2026-08-13T16:00:00.000Z'
+  });
+  assert.equal(replay.result.status, 'already_applied');
+  assert.equal(replay.state.domain.accounts.filter(item => item.sourceKind === 'csv').length, 3);
+  assert.equal(replay.state.domain.transactions.filter(item => item.sourceKind === 'csv').length, 3);
+});
+
 test('Candidate 1 legacy receipt proof remains valid with corrected mapped account identity', async () => {
   const csv = [
     'date,description,amount,account,transaction_id,currency',
@@ -1572,6 +1875,24 @@ test('Candidate 1 legacy receipt proof remains valid with corrected mapped accou
   assert.equal(replay.result.status, 'already_applied');
   assert.equal(replay.changed, false);
   assert.equal(replay.state.domain.transactions.find(item => item.sourceKind === 'csv').sourceAccountRef, 'mapping:mapped:legacy-checking');
+});
+
+test('legacy receipt effect proof cannot substitute a boundary-distinct account identity', async () => {
+  const original = await appliedCandidate1Csv({
+    csv:'date,description,amount,account_id,transaction_id,currency\n2026-08-01,Coffee,5.25,foo,legacy-space-proof,USD',
+    profile:{id:'legacy-whitespace-effect-proof', signProfile:'positive_outflow'}
+  });
+  const boundaryDistinct = structuredClone(original.original);
+  for (const mutation of boundaryDistinct.accountMutations) mutation.sourceAccountRef = 'external:foo ';
+  for (const mutation of boundaryDistinct.transactionMutations) mutation.sourceAccountRef = 'external:foo ';
+  boundaryDistinct.payloadDigest = '';
+  const finalized = await finalizeMutationBatch(boundaryDistinct);
+  const before = structuredClone(original.state);
+  await assert.rejects(
+    () => reconcileMutationBatch(original.state, finalized, {idFactory:ids(), now:V3A_NOW}),
+    error => error.code === 'BATCH_ID_COLLISION'
+  );
+  assert.deepEqual(original.state, before);
 });
 
 test('identical CSV content and profile replay across production times without a batch collision', async () => {
@@ -2197,6 +2518,60 @@ test('schema 9 CSV identities survive migration and identical adapter reimport w
     error => error.code === 'TRANSACTION_ADD_CONFLICT'
   );
   assert.deepEqual(migrated, beforeChangedAmount);
+});
+
+test('schema 9 whitespace identities migrate exactly and identical CSV reimport preserves user meaning and local IDs', async () => {
+  const schema9 = toSchema9(freshState());
+  const account = {
+    id:'legacy-whitespace-account', institutionId:null, externalAccountId:' stable-account ',
+    friendlyName:'Whitespace Checking', officialName:'Whitespace Checking', mask:'4321', type:'depository',
+    subtype:'checking', currency:'USD', source:'csv', active:true, balanceCents:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  const transaction = {
+    id:'legacy-whitespace-transaction', accountId:account.id, source:'csv', sourceTransactionId:' stable-tx ',
+    rawName:'Exact Coffee', merchantName:'Exact Coffee', amountCents:-1000, currency:'USD', authorizedAt:null,
+    postedAt:'2026-08-01', displayDate:'2026-08-01', pendingStatus:'posted', movementType:'expense',
+    reviewStatus:'reviewed', locationRegion:null, locationCountry:null, locationSource:null, providerCategory:null,
+    manualOverrides:{merchantName:'User Exact Coffee'}, userNote:'Preserve exact identity note',
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  };
+  schema9.domain.accounts.push(account);
+  schema9.domain.transactions.push(transaction);
+  const bucket = schema9.domain.buckets.find(item => !item.system && item.parentId === null);
+  schema9.domain.allocations.push({
+    id:'legacy-whitespace-allocation', transactionId:transaction.id, bucketId:bucket.id, subBucketId:null,
+    amountCents:1000, ownershipType:'mine', note:'Preserve exact allocation', reimbursementClaimId:null,
+    createdAt:V3A_NOW, updatedAt:V3A_NOW
+  });
+
+  const migrated = migrateState(schema9, {now:V3A_NOW}).state;
+  assert.equal(migrated.domain.accounts.find(item => item.id === account.id).sourceAccountRef, 'external: stable-account ');
+  assert.equal(migrated.domain.transactions.find(item => item.id === transaction.id).sourceRecordRef, 'external: stable-tx ');
+  const batch = await createCsvMutationBatch({
+    csvText:[
+      'date,description,amount,account_name,account_id,transaction_id,mask,account_type,account_subtype',
+      '2026-08-01,Exact Coffee,10.00,Whitespace Checking," stable-account "," stable-tx ",4321,depository,checking'
+    ].join('\n'),
+    producedAt:V3A_NOW,
+    profile:{id:'legacy'}
+  });
+  const reapplied = await reconcileMutationBatch(migrated, batch, {idFactory:ids(), now:V3A_NOW});
+  assert.equal(reapplied.result.counts.accountsAdded, 0);
+  assert.equal(reapplied.result.counts.transactionsAdded, 0);
+  assert.equal(reapplied.state.domain.accounts.find(item => item.sourceAccountRef === 'external: stable-account ').id, account.id);
+  const retained = reapplied.state.domain.transactions.find(item => item.sourceRecordRef === 'external: stable-tx ');
+  assert.equal(retained.id, transaction.id);
+  assert.equal(retained.accountId, account.id);
+  assert.equal(retained.movementType, 'expense');
+  assert.equal(retained.reviewStatus, 'reviewed');
+  assert.deepEqual(retained.manualOverrides, {merchantName:'User Exact Coffee'});
+  assert.equal(retained.userNote, 'Preserve exact identity note');
+  assert.equal(retained.interpretationConflictId, null);
+  const allocation = reapplied.state.domain.allocations.find(item => item.id === 'legacy-whitespace-allocation');
+  assert.equal(allocation.transactionId, transaction.id);
+  assert.equal(allocation.status, 'active');
+  assert.equal(allocation.note, 'Preserve exact allocation');
 });
 
 test('migrated schema-9 external identity remains distinct from collision-looking saved mapping identity', async () => {

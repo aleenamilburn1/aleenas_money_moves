@@ -50,6 +50,14 @@ function firstValue(row, names = []) {
   return '';
 }
 
+function firstOpaqueIdentityValue(row, names = []) {
+  for (const name of names) {
+    const value = row[name];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return '';
+}
+
 function calendarDate(value) {
   const text = String(value || '').trim();
   if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
@@ -91,7 +99,7 @@ function accountMappingIndex(accountMappings) {
   const result = new Map();
   for (const [label, reference] of Object.entries(accountMappings)) {
     const normalizedLabel = normalizedMappingLabel(label);
-    const stableReference = typeof reference === 'string' ? reference.trim() : '';
+    const stableReference = typeof reference === 'string' ? reference : '';
     if (!normalizedLabel || !stableReference) {
       throw new CsvAccountIdentityError('CSV_ACCOUNT_MAPPING_INVALID', {reason:'mapping_entries_require_label_and_reference'});
     }
@@ -117,8 +125,8 @@ function accountMappingIndex(accountMappings) {
 }
 
 function sourceAccountReference(row, profile, mappings) {
-  const external = firstValue(row, profile.accountIdColumns);
-  if (external) return {
+  const external = firstOpaqueIdentityValue(row, profile.accountIdColumns);
+  if (external !== '') return {
     sourceAccountRef:canonicalExternalSourceReference(external),
     sourceAccountIdentityDomain:SOURCE_ACCOUNT_IDENTITY_DOMAINS.EXTERNAL
   };
@@ -233,8 +241,8 @@ export async function createCsvMutationBatch({
 
   for (const {row, line, sourceAccountIdentity} of resolvedRows) {
     const {sourceAccountRef, sourceAccountIdentityDomain} = sourceAccountIdentity;
-    const externalRef = firstValue(row, profile.transactionIdColumns);
-    const sourceRecordRef = externalRef ? canonicalExternalSourceReference(externalRef) : `file:${fileDigest}:row:${line}`;
+    const externalRef = firstOpaqueIdentityValue(row, profile.transactionIdColumns);
+    const sourceRecordRef = externalRef !== '' ? canonicalExternalSourceReference(externalRef) : `file:${fileDigest}:row:${line}`;
     const observedAt = producedAt;
     const amountInput = sourceAmountInput(row, profile);
     const currencyText = firstValue(row, profile.currencyColumns) || (profile.currencyGuaranteed ? profile.currency : '');

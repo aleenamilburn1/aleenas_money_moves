@@ -1,7 +1,7 @@
 # Money Moves V3A — Provider-Neutral Ingestion Implementation
 
-Date: 2026-08-13
-Status: CANDIDATES 1–5 REJECTED; ACCOUNT-IDENTITY DOMAIN-SEPARATION REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
+Date: 2026-08-14
+Status: CANDIDATES 1–6 REJECTED; EXACT OPAQUE-IDENTITY REMEDIATION IMPLEMENTED / AWAITING INDEPENDENT RE-ACCEPTANCE
 Domain schema: 10
 Trusted parent: `5d2c44925931292724bc4a2d62cfade3c969f606` (`v3-plaid-architecture-accepted`)
 Rejected Candidate 1: `1b45e1c8b85789a3847b19afef6567a7dd4b2f3c` (`v3a-provider-neutral-ingestion-candidate`)
@@ -9,7 +9,8 @@ Rejected Candidate 2: `c2adfaca8411b2bdc9a050097452021e79928fcb` (`v3a-provider-
 Rejected Candidate 3: `dce5bb2c812fef1332e3c81153f93a68de0a6871` (`v3a-provider-neutral-ingestion-candidate-3`)
 Rejected Candidate 4: `72f21872d70504db5d11f79ec18c3d53e94c42da` (`v3a-provider-neutral-ingestion-candidate-4`)
 Rejected Candidate 5: `7731fdc519d71420ddf4cee655a03e5303584090` (`v3a-provider-neutral-ingestion-candidate-5`)
-Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-6`
+Rejected Candidate 6: `640ef416d3a1a90295fc5f71cf610b1122b7aabd` (`v3a-provider-neutral-ingestion-candidate-6`)
+Remediation candidate tag: `v3a-provider-neutral-ingestion-candidate-7`
 
 ## Outcome and scope
 
@@ -87,6 +88,16 @@ centralized injective source-account encoder so external, mapping,
 migrated-local, direct adapter, and Unknown identities cannot collapse solely
 because their payload strings look alike.
 
+Independent acceptance rejected Candidate 6 after reproducing a ninth blocker.
+The centralized encoder called `.trim()` on opaque payloads, while the CSV
+external-ID reader, saved-mapping value reader, manual adapter, and schema-9
+migration also trimmed identities before or during encoding. Raw `foo`,
+` foo`, `foo `, and ` foo ` therefore collapsed within one domain. Candidate 7
+preserves exact source identity payloads, retains typed structural rejection,
+and replaces delimiter-concatenated identity tuples in migration, model
+validation, reconciliation, lineage, and receipt-effect proof with injective
+tuple serialization.
+
 ## Requirements affected
 
 The implementation follows the PRD's provider-metadata, traceability,
@@ -145,8 +156,9 @@ provider connection, account mask, location, merchant, or reimbursement.
 
 Candidate 5 routes raw CSV external account and transaction IDs through the
 same `canonicalExternalSourceReference` contract function used by CSV
-ingestion. A raw ID is opaque after contract-approved outer trimming: no case,
-Unicode, punctuation, colon, or internal-whitespace normalization occurs. Raw
+ingestion. Candidate 7 makes the raw ID fully opaque: no trimming, case change,
+Unicode normalization, whitespace normalization, punctuation change, or
+truncation occurs. Raw
 `foo` becomes `external:foo`; raw `external:foo` becomes
 `external:external:foo`, so prefix-looking raw data cannot collapse with
 already-canonical data. Candidate 6 routes account identities through
@@ -202,6 +214,14 @@ across domains. The closed batch and persisted models carry and validate
 `sourceAccountIdentityDomain`; transactions must agree with their referenced
 canonical account. The Unknown sentinel is the only deliberate cross-namespace
 shared account.
+
+Exact identity policy is structural rather than semantic. `""` is invalid.
+Non-empty ASCII-space-only and NBSP-only payloads are valid and remain exact;
+boundary whitespace counts toward the 256-character canonical-reference
+limit. C0/C1 controls and DEL, including tab, are rejected with a typed contract
+error. Over-limit references are rejected and never truncated. Mapping lookup
+labels still use NFKC, trim, repeated-whitespace normalization, and lowercase
+for configuration lookup only; the selected mapping value is encoded exactly.
 
 ### CSV source-account resolution hierarchy
 
@@ -473,9 +493,17 @@ and these three engineering documents. It adds no dependency, schema version,
 migration step, UI, backend, network path, credential, provider product, FX
 behavior, Reports UI, or build artifact.
 
+Candidate 7 changes `js/domain/ingestionContract.js`,
+`js/adapters/csvIngestionAdapter.js`, `js/adapters/manualIngestionAdapter.js`,
+`js/domain/migrations.js`, `js/domain/models.js`,
+`js/services/ingestionService.js`, `test/provider-neutral-ingestion.test.js`,
+and these three engineering documents. It adds no dependency, schema version,
+migration step, UI, backend, network path, credential, provider product, FX
+behavior, Reports UI, Windows work, or build artifact.
+
 ## Tests and fixtures
 
-The 125 focused V3A checks use only synthetic manual, CSV, and fixture-provider
+The focused V3A checks use only synthetic manual, CSV, and fixture-provider
 values.
 They cover exact cents and sign matrices; malformed, huge, zero, missing,
 invalid, and foreign-currency values; closed contract limits; account and
@@ -522,15 +550,58 @@ identity domains, semantic-digest separation, migrated external versus mapped
 identity, mixed-domain atomic retry, encrypted dual-domain restore/reimport,
 and fail-closed schema-10 candidate state without domain provenance.
 
-Full remediation validation records 356 unit tests, 125 focused V3A tests, and
-38 Electron-focused tests,
-all passing with zero failures, skips, or todos. No dependency was added.
+Candidate 7 adds the independently reproduced `foo` / ` foo` / `foo ` / NBSP
+within-domain collision matrix; deterministic generated/adversarial injectivity
+and all-domain disjointness; per-domain maximum-length and over-limit failure;
+exact mapping values with normalized lookup labels; exact manual and fixture
+direct identities; account-scoped equal transaction IDs; pipe/delimiter tuple
+collisions; mixed valid/invalid atomic retry; exact tombstone/revival;
+whitespace-sensitive legacy receipt proof; schema-9 whitespace migration with
+zero new entities and preserved user meaning; and encrypted exact-identity
+backup/restore followed by idempotent reimport.
+
+Candidate-7 validation passes `pnpm run check`; 372 full unit tests; 141
+focused V3A tests; and 38 Electron tests, with zero failures, skips, todos, or
+cancellations. `git diff --check` also passes. No dependency was added.
+
+## Candidate 7 identity transformation audit
+
+- **Opaque identity — changed:** `encodeSourceAccountReference` no longer trims
+  payloads. It preserves exact strings, rejects empty/non-string/control/over-limit
+  values with typed errors, and never truncates or normalizes.
+- **Opaque identity — changed:** CSV explicit account IDs and transaction IDs
+  use an exact field reader instead of the presentation-oriented trimmed reader.
+- **Opaque identity — changed:** saved mapping values are encoded exactly;
+  whitespace-only non-empty values remain valid, while existing sentinel,
+  legacy-label, control, non-string, empty, and length rejection remains.
+- **Lookup normalization — retained:** saved mapping labels continue to use
+  NFKC, trim, repeated-whitespace collapse, and lowercase solely to find the
+  saved mapping configuration.
+- **Opaque identity — changed:** manual direct account identity and manual
+  source-record references are no longer pre-trimmed. The fixture adapter was
+  already exact and required no behavior change.
+- **Opaque identity — changed:** schema-9 account `externalAccountId` and
+  transaction `sourceTransactionId` are selected without trimming, then use the
+  same exact encoder as current CSV ingestion.
+- **Opaque identity — changed:** migration count keys, model relationship keys,
+  reconciliation indexes, lineage keys, quarantine-effect keys, and legacy
+  receipt proof now serialize identity tuples injectively rather than joining
+  opaque fields with a valid payload delimiter.
+- **Opaque identity — retained:** semantic batch digests, persisted account and
+  transaction refs, quarantine/tombstone refs, source history, aliases, and
+  receipt-effect comparisons already use exact string/JSON equality.
+- **Persistence/restore — retained:** `stateService`, `vaultRepository`, and the
+  encrypted vault serialize and restore JSON without identity normalization.
+- **Presentation metadata — retained:** account labels, institution/type text,
+  dates, currency, descriptions, and friendly-name display cleanup retain their
+  existing field-specific normalization because they do not define opaque
+  canonical identity.
 
 ## Schema decision
 
 The schema remains 10 because V3A has not been accepted or released. Candidate
-6 corrects the not-yet-accepted schema-9→10 conversion and adapter boundary in
-place. Schema-10 accounts, transactions, quarantines, and tombstones now carry
+7 corrects the not-yet-accepted schema-9→10 conversion and exact identity
+boundary in place. Schema-10 accounts, transactions, quarantines, and tombstones now carry
 the structural `sourceAccountIdentityDomain` required to interpret their
 canonical account reference. The migration assigns `external` only from a
 unique legacy external CSV account ID, `migrated_local` when a stable local ID
@@ -583,7 +654,7 @@ interpretation continue to persist only through the existing encrypted vault.
 
 ## Known limitations
 
-- Candidates 1–5 were rejected; Candidate 6 awaits independent re-acceptance.
+- Candidates 1–6 were rejected; Candidate 7 awaits independent re-acceptance.
 - There is no dedicated account-mapping UI in V3A. CSVs without stable account
   IDs require an existing saved mapping; same-label distinct accounts require
   distinct source IDs or a future richer explicit mapping workflow.
@@ -592,10 +663,10 @@ interpretation continue to persist only through the existing encrypted vault.
   remediation.
 - Unreleased schema-10 raw migrated external references are detected only by a
   deterministic same-namespace account/transaction match and fail closed for
-  controlled remediation; Candidate 6 does not guess or rewrite candidate
+  controlled remediation; Candidate 7 does not guess or rewrite candidate
   history.
 - Unreleased Candidate-4/5 schema-10 CSV identities without structural domain
-  provenance fail closed. Candidate 6 cannot safely reconstruct or separate
+  provenance fail closed. Candidate 7 cannot safely reconstruct or separate
   identities that a rejected candidate may already have collapsed.
 - A structurally valid Candidate-1 receipt is insufficient by itself. Legacy
   replay fails closed when schema-10 state cannot independently prove its
@@ -614,8 +685,8 @@ interpretation continue to persist only through the existing encrypted vault.
 ## Recommended next task
 
 Run an independent V3A re-acceptance review from
-`v3a-provider-neutral-ingestion-candidate-6`. Re-read the
+`v3a-provider-neutral-ingestion-candidate-7`. Re-read the
 five authoritative V3 documents, audit schema-9 migration and field ownership,
-repeat the 356-unit/125-focused/38-Electron validation gate, add adversarial cases if any
+repeat the 372-unit/141-focused/38-Electron validation gate, add adversarial cases if any
 gap is found, and issue a separate acceptance or rejection record. Do not begin
 V3B from this implementation report alone.

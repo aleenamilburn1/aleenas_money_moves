@@ -67,7 +67,9 @@ export function encodeSourceAccountReference(domain, rawValue = null) {
     }
     return 'unknown-account';
   }
-  const raw = typeof rawValue === 'string' ? rawValue.trim() : '';
+  // Identity payloads are opaque source data. Preserve every code unit exactly;
+  // validation may reject a value, but canonicalization must never rewrite it.
+  const raw = typeof rawValue === 'string' ? rawValue : '';
   const prefix = SOURCE_ACCOUNT_IDENTITY_PREFIXES[domain] || '';
   const canonical = `${prefix}${raw}`;
   if (!raw) errors.push('rawValue must be a non-empty string');
@@ -448,7 +450,7 @@ function validateDuplicateAndLineageRules(batch, errors) {
     if (accounts.has(mutation.sourceAccountRef)) errors.push(`duplicate account mutation for ${mutation.sourceAccountRef}`);
     accounts.add(mutation.sourceAccountRef);
   }
-  const transactionKey = (accountRef, recordRef) => `${accountRef}\u001f${recordRef}`;
+  const transactionKey = (accountRef, recordRef) => JSON.stringify([accountRef, recordRef]);
   const transactions = new Map();
   const transactionsByRef = new Map();
   const successorByPredecessor = new Map();

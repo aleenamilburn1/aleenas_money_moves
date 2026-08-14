@@ -2,12 +2,12 @@ import {normalizeCurrency, parseExactUsdAmount} from '../domain/exactMoney.js';
 import {encodeSourceAccountReference, SOURCE_ACCOUNT_IDENTITY_DOMAINS} from '../domain/ingestionContract.js';
 import {finishAdapterBatch, normalizedAccount, normalizedTransaction, quarantineRecord} from './adapterUtils.js';
 
-function text(value) {
-  return typeof value === 'string' ? value.trim() : '';
+function opaqueIdentity(value) {
+  return typeof value === 'string' ? value : '';
 }
 
 function manualAccountIdentity(value) {
-  const raw = text(value);
+  const raw = opaqueIdentity(value);
   if (!raw) return {sourceAccountRef:null, sourceAccountIdentityDomain:null};
   if (raw === 'unknown-account') return {
     sourceAccountRef:encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN),
@@ -22,7 +22,7 @@ function manualAccountIdentity(value) {
 function quarantineFromManual(item, producedAt, reason, safeDetailCode) {
   const accountIdentity = manualAccountIdentity(item.sourceAccountRef);
   return quarantineRecord({
-    sourceRecordRef:text(item.sourceRecordRef) || 'invalid-manual-record',
+    sourceRecordRef:opaqueIdentity(item.sourceRecordRef) || 'invalid-manual-record',
     ...accountIdentity,
     observedAt:item.observedAt || producedAt,
     reason,
@@ -65,7 +65,7 @@ export async function createManualMutationBatch({
       });
       continue;
     }
-    if (!text(item.sourceRecordRef) || !text(item.sourceAccountRef)) {
+    if (!opaqueIdentity(item.sourceRecordRef) || !opaqueIdentity(item.sourceAccountRef)) {
       quarantinedRecords.push(quarantineFromManual(item, producedAt, 'missing_account', 'MANUAL_IDENTITY_REQUIRED'));
       continue;
     }

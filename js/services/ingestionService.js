@@ -38,12 +38,16 @@ function defaultIdFactory(prefix) {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
+function identityTuple(...values) {
+  return JSON.stringify(values);
+}
+
 function sourceKey(sourceKind, sourceNamespace, sourceRef) {
-  return `${sourceKind}\u001f${sourceNamespace}\u001f${sourceRef}`;
+  return identityTuple(sourceKind, sourceNamespace, sourceRef);
 }
 
 function transactionSourceKey(sourceKind, sourceNamespace, sourceAccountRef, sourceRecordRef) {
-  return `${sourceKind}\u001f${sourceNamespace}\u001f${sourceAccountRef}\u001f${sourceRecordRef}`;
+  return identityTuple(sourceKind, sourceNamespace, sourceAccountRef, sourceRecordRef);
 }
 
 function ensureCollections(domain) {
@@ -923,7 +927,7 @@ function provesRejectedCandidateCsvEffects(state, receipt, batch) {
     if (!matches.length) return false;
   }
   const createdQuarantines = domain.sourceQuarantines.filter(item => item.batchId === batch.batchId);
-  const quarantineEvidenceKey = item => `${item.sourceAccountRef}\u001f${item.sourceRecordRef}`;
+  const quarantineEvidenceKey = item => identityTuple(item.sourceAccountRef, item.sourceRecordRef);
   if (createdQuarantines.length !== counts.sourceRecordsQuarantined
     || new Set(createdQuarantines.map(quarantineEvidenceKey)).size !== createdQuarantines.length
     || createdQuarantines.some(item => !batch.quarantinedRecords.some(record => quarantineMatchesBatchRecord(item, batch, record)))) return false;

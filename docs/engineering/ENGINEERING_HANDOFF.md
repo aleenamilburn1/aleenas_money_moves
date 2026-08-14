@@ -14,7 +14,7 @@
 - Founder direction: macOS-first Electron desktop app with one authoritative encrypted local vault per owner.
 - V3 Plaid/provider-neutral ingestion Architecture Candidate 1 is preserved at `4ba0e65da73917d6a8b2b6d3fd20eb36a7dc641b` and annotated tag `v3-plaid-architecture-candidate`.
 - V3 Architecture Candidate 2 incorporates the founder-approved USD, pseudonymous identity, duplicate connection, backend retention, and quarterly-reporting policies. Candidate 2 is independently accepted by `V3_PLAID_ARCHITECTURE_ACCEPTANCE.md`; annotated tag `v3-plaid-architecture-accepted` identifies the documentation-only acceptance checkpoint.
-- V3A provider-neutral ingestion Candidates 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`), 2 (`c2adfaca8411b2bdc9a050097452021e79928fcb`), 3 (`dce5bb2c812fef1332e3c81153f93a68de0a6871`), 4 (`72f21872d70504db5d11f79ec18c3d53e94c42da`), and 5 (`7731fdc519d71420ddf4cee655a03e5303584090`) were rejected by independent acceptance. Their five annotated candidate tags remain preserved. Candidate 6 separates external, saved-mapping, migrated-local, direct-adapter, and Unknown account identities with structural persisted provenance, retains schema 10, and is identified by annotated tag `v3a-provider-neutral-ingestion-candidate-6` after all gates pass. Candidate 6 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, or Reports UI.
+- V3A provider-neutral ingestion Candidates 1 (`1b45e1c8b85789a3847b19afef6567a7dd4b2f3c`), 2 (`c2adfaca8411b2bdc9a050097452021e79928fcb`), 3 (`dce5bb2c812fef1332e3c81153f93a68de0a6871`), 4 (`72f21872d70504db5d11f79ec18c3d53e94c42da`), 5 (`7731fdc519d71420ddf4cee655a03e5303584090`), and 6 (`640ef416d3a1a90295fc5f71cf610b1122b7aabd`) were rejected by independent acceptance. Their six annotated candidate tags remain preserved. Candidate 7 preserves exact opaque account-identity payloads and hardens adjacent tuple serialization while retaining Candidate 6's structural domains and schema 10. It is identified by annotated tag `v3a-provider-neutral-ingestion-candidate-7` only after all gates pass. Candidate 7 awaits independent re-acceptance; there is still no live provider connection, network path, backend, credential, FX, cursor, webhook, Reports UI, Windows work, or V3B behavior.
 
 ## Desktop foundation
 
@@ -333,6 +333,26 @@ same-namespace reconciliation fail closed with
 `CSV_LEGACY_ACCOUNT_IDENTITY_DOMAIN_UNRESOLVED` for controlled remediation.
 Schema remains 10 because no V3A candidate has been accepted or released.
 
+Independent acceptance rejected Candidate 6 because the centralized encoder
+and several callers trimmed opaque payloads. Within one domain, `foo`, ` foo`,
+`foo `, and ` foo ` collapsed. CSV external IDs and transaction IDs used a
+trimmed generic field reader; saved mapping values were trimmed; manual direct
+account identities were trimmed; and schema-9 migration trimmed external
+account/transaction IDs before encoding.
+
+Candidate 7 preserves exact non-empty identity strings through the centralized
+encoder, CSV, saved mappings, manual/fixture adapters, schema-9 migration,
+semantic digests, persistence, restore, tombstones, and legacy effect proof.
+ASCII-space-only and NBSP-only payloads are valid exact data. Empty strings,
+non-strings, controls (including tab), and over-limit canonical references fail
+closed with typed errors; nothing is normalized or truncated. Mapping selector
+labels still use NFKC/case/whitespace normalization for lookup only. Candidate
+7 also replaces `|`/control-delimited in-memory identity tuples with JSON tuple
+serialization in migration counting, batch lineage validation, reconciliation
+indexes, model relationship validation, quarantine proof, and legacy receipt
+effect proof. Schema remains 10 and ambiguous Candidate-4/5 schema-10 state
+still returns `CSV_LEGACY_ACCOUNT_IDENTITY_DOMAIN_UNRESOLVED`.
+
 Canonical transaction identity is now
 `sourceKind + sourceNamespace + sourceAccountIdentityDomain + sourceAccountRef + sourceRecordRef`.
 The schema-9→10 migration is corrected in place. One shared
@@ -350,25 +370,25 @@ future local V3R phase without implementing report calculations or snapshots.
 Fresh remediation validation passed:
 
 - `CI=true pnpm run check`: passed.
-- `CI=true pnpm test`: 356 passed, 0 failed, 0 skipped, 0 todo.
+- `CI=true pnpm test`: 372 passed, 0 failed, 0 skipped, 0 todo, 0 cancelled.
 - `CI=true pnpm run electron:test`: 38 passed, 0 failed, 0 skipped, 0 todo.
-- Focused V3A suite: 125 passed, 0 failed, 0 skipped, 0 todo.
+- Focused V3A suite: 141 passed, 0 failed, 0 skipped, 0 todo, 0 cancelled.
 - `git diff --check` and the forbidden-capability/security scans: passed.
 
-These are implementation results, not independent acceptance. Candidates 1–5
-and all five annotated tags remain intact; the remediation is identified by
-annotated tag `v3a-provider-neutral-ingestion-candidate-6`. V3B may begin only
+These are implementation results, not independent acceptance. Candidates 1–6
+and all six annotated tags remain intact; the remediation is identified by
+annotated tag `v3a-provider-neutral-ingestion-candidate-7`. V3B may begin only
 after a new, separate V3A review records re-acceptance.
 
 ## Recommended next task
 
 Open a new bounded independent V3A re-acceptance task from
-`v3a-provider-neutral-ingestion-candidate-6`. Re-read
+`v3a-provider-neutral-ingestion-candidate-7`. Re-read
 the PRD, all four V3 architecture documents, the architecture acceptance, and
 the V3A implementation report; independently review schema-9 migration, source
 identity, exact money, ownership, reconciliation, atomic persistence, backup,
-history retention, and scope/privacy boundaries. Repeat the 356-unit,
-125-focused, and 38-Electron gates and record acceptance or rejection separately. Do not begin
+history retention, and scope/privacy boundaries. Repeat the 372-unit,
+141-focused, and 38-Electron gates and record acceptance or rejection separately. Do not begin
 V3B, V3C, V3D, V3R, or V3E until each preceding phase receives its own
 implementation and independent acceptance. The remaining human Finder/Dock/
 application-switcher icon-cache visual check remains a low-risk V2D follow-up.

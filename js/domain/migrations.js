@@ -407,8 +407,7 @@ function adapterKindForLegacySource(source) {
 }
 
 function existingReference(value) {
-  const candidate = clean(value);
-  return candidate || null;
+  return typeof value === 'string' && value !== '' ? value : null;
 }
 
 function migratedSourceReference(source, preferred) {
@@ -451,7 +450,7 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const namespace = providerNeutralNamespace(source);
     const preferred = existingReference(account.externalAccountId);
     if (preferred) {
-      const key = `${providerNeutralSourceKind(source)}|${namespace}|${preferred}`;
+      const key = stableSerialize([providerNeutralSourceKind(source), namespace, preferred]);
       accountPreferredRefs.set(key, (accountPreferredRefs.get(key) || 0) + 1);
     }
   }
@@ -460,7 +459,7 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const sourceKind = providerNeutralSourceKind(source);
     const sourceNamespace = account.id === UNKNOWN_ACCOUNT_ID ? 'manual:vault' : providerNeutralNamespace(source);
     const preferred = existingReference(account.externalAccountId);
-    const countKey = `${sourceKind}|${sourceNamespace}|${preferred}`;
+    const countKey = stableSerialize([sourceKind, sourceNamespace, preferred]);
     const accountIdentity = account.id === UNKNOWN_ACCOUNT_ID
       ? {
         sourceAccountRef:encodeSourceAccountReference(SOURCE_ACCOUNT_IDENTITY_DOMAINS.UNKNOWN),
@@ -497,7 +496,7 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const account = accountById.get(transaction.accountId);
     const preferred = existingReference(transaction.sourceTransactionId);
     if (!preferred) continue;
-    const key = `${sourceKind}|${namespace}|${account?.sourceAccountRef || 'unknown-account'}|${preferred}`;
+    const key = stableSerialize([sourceKind, namespace, account?.sourceAccountRef || 'unknown-account', preferred]);
     transactionPreferredRefs.set(key, (transactionPreferredRefs.get(key) || 0) + 1);
   }
   for (const transaction of domain.transactions) {
@@ -505,7 +504,7 @@ function initializeProviderNeutralIngestion(state, {now}) {
     const sourceNamespace = providerNeutralNamespace(transaction.source);
     const preferred = existingReference(transaction.sourceTransactionId);
     const account = accountById.get(transaction.accountId);
-    const key = `${sourceKind}|${sourceNamespace}|${account?.sourceAccountRef || 'unknown-account'}|${preferred}`;
+    const key = stableSerialize([sourceKind, sourceNamespace, account?.sourceAccountRef || 'unknown-account', preferred]);
     const sourceRecordRef = preferred && transactionPreferredRefs.get(key) === 1
       ? migratedSourceReference(transaction.source, preferred)
       : `transaction:${transaction.id}`;
